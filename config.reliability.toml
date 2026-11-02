@@ -1,0 +1,38 @@
+# Configuration for Week 3 real-backend reliability experiments.
+# Short health interval and debounce thresholds make removal/recovery
+# observable within seconds on a local machine.
+
+[server]
+host = "127.0.0.1"
+port = 18080
+strategy = "session_affinity"
+health_interval_s = 0.5
+upstream_timeout_s = 300.0
+upstream_connect_timeout_s = 2.0
+max_connections_per_backend = 64
+max_keepalive_connections = 16
+
+[admission]
+enabled = true
+max_in_flight = 8
+max_queue_size = 16
+queue_timeout_ms = 2000
+
+[deadline]
+request_timeout_ms = 60000
+execution_timeout_ms = 30000
+
+[retry]
+max_retries = 1
+
+[health]
+failure_threshold = 2
+success_threshold = 2
+
+[[backends]]
+id = "a"
+url = "http://127.0.0.1:18090"
+
+[[backends]]
+id = "b"
+url = "http://127.0.0.1:18091"

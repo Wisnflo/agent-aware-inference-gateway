@@ -1,0 +1,49 @@
+# Example gateway configuration. Copy to config.toml and edit.
+# The two backends are independent llama-server processes serving the same model.
+
+[server]
+host = "127.0.0.1"
+port = 18080
+# "session_affinity" (X-Session-ID -> stable backend) or "round_robin".
+strategy = "session_affinity"
+health_interval_s = 5.0
+upstream_timeout_s = 300.0
+upstream_connect_timeout_s = 5.0
+max_connections_per_backend = 64
+max_keepalive_connections = 16
+
+# Bounded admission. Every request is routed first, then admitted against the
+# target backend's queue. Set enabled = false only for benchmark baselines.
+[admission]
+enabled = true
+max_in_flight = 8
+max_queue_size = 16
+queue_timeout_ms = 2000
+
+# Optional per-backend execution caps. Each value must be <= max_in_flight.
+# Without entries, each backend may use the whole global capacity.
+[admission.per_backend]
+a = 4
+b = 4
+
+# Whole-request and execution budgets (monotonic, never reset by retries).
+[deadline]
+request_timeout_ms = 60000
+execution_timeout_ms = 30000
+
+# Retry only safe pre-dispatch connection failures.
+[retry]
+max_retries = 1
+
+# Health debounce: N consecutive failures remove, N successes restore.
+[health]
+failure_threshold = 2
+success_threshold = 2
+
+[[backends]]
+id = "a"
+url = "http://127.0.0.1:18090"
+
+[[backends]]
+id = "b"
+url = "http://127.0.0.1:18091"
