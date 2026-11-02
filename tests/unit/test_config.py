@@ -69,7 +69,7 @@ def test_missing_field_reports_position():
 
 
 def test_non_numeric_port_rejected():
-    with pytest.raises(ConfigError, match="port must be a number"):
+    with pytest.raises(ConfigError, match="port must be an integer"):
         config_from_mapping(
             {
                 "server": {"port": "8080"},
@@ -278,4 +278,44 @@ def test_reliability_unknown_keys_rejected():
                 "backends": [{"id": "a", "url": "http://127.0.0.1:1"}],
                 "health": {"threshold": 1},
             }
+        )
+
+
+def test_server_port_must_be_integer():
+    with pytest.raises(ConfigError, match="port must be an integer"):
+        config_from_mapping(
+            {
+                "server": {"port": 18080.5},
+                "backends": [{"id": "a", "url": "http://127.0.0.1:1"}],
+            }
+        )
+    with pytest.raises(ConfigError, match="port must be an integer"):
+        GatewayConfig(
+            backends=(BackendConfig("a", "http://127.0.0.1:1"),), port=18080.5
+        )
+
+
+def test_connection_limits_must_be_integers():
+    with pytest.raises(ConfigError, match="max_connections_per_backend"):
+        config_from_mapping(
+            {
+                "server": {"max_connections_per_backend": 4.5},
+                "backends": [{"id": "a", "url": "http://127.0.0.1:1"}],
+            }
+        )
+    with pytest.raises(ConfigError, match="max_keepalive_connections"):
+        config_from_mapping(
+            {
+                "server": {"max_keepalive_connections": 2.5},
+                "backends": [{"id": "a", "url": "http://127.0.0.1:1"}],
+            }
+        )
+
+
+def test_keepalive_limit_must_not_exceed_connection_limit():
+    with pytest.raises(ConfigError, match="must not exceed"):
+        GatewayConfig(
+            backends=(BackendConfig("a", "http://127.0.0.1:1"),),
+            max_connections_per_backend=4,
+            max_keepalive_connections=8,
         )

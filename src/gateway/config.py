@@ -179,6 +179,8 @@ class GatewayConfig:
             raise ConfigError(
                 f"unknown strategy {self.strategy!r}; expected one of {', '.join(STRATEGIES)}"
             )
+        if isinstance(self.port, bool) or not isinstance(self.port, int):
+            raise ConfigError("server port must be an integer")
         if not 1 <= self.port <= 65535:
             raise ConfigError(f"server port out of range: {self.port}")
         if self.health_interval_s <= 0:
@@ -187,8 +189,22 @@ class GatewayConfig:
             raise ConfigError("upstream_timeout_s must be positive")
         if self.upstream_connect_timeout_s <= 0:
             raise ConfigError("upstream_connect_timeout_s must be positive")
-        if self.max_connections_per_backend <= 0:
-            raise ConfigError("max_connections_per_backend must be positive")
+        if (
+            isinstance(self.max_connections_per_backend, bool)
+            or not isinstance(self.max_connections_per_backend, int)
+            or self.max_connections_per_backend <= 0
+        ):
+            raise ConfigError("max_connections_per_backend must be a positive integer")
+        if (
+            isinstance(self.max_keepalive_connections, bool)
+            or not isinstance(self.max_keepalive_connections, int)
+            or self.max_keepalive_connections < 0
+        ):
+            raise ConfigError("max_keepalive_connections must be a non-negative integer")
+        if self.max_keepalive_connections > self.max_connections_per_backend:
+            raise ConfigError(
+                "max_keepalive_connections must not exceed max_connections_per_backend"
+            )
         for backend_id, limit in self.admission.per_backend:
             if backend_id not in seen:
                 raise ConfigError(
@@ -250,6 +266,9 @@ def config_from_mapping(data: Mapping[str, Any]) -> GatewayConfig:
         if isinstance(value, bool) or not isinstance(value, int):
             raise ConfigError(f"{prefix}.{key} must be an integer")
         return value
+
+    def server_integer(key: str, default: int) -> int:
+        return integer(server, key, default, "server")
 
     enabled = admission_data.get("enabled", True)
     if not isinstance(enabled, bool):
@@ -324,13 +343,13 @@ def config_from_mapping(data: Mapping[str, Any]) -> GatewayConfig:
     return GatewayConfig(
         backends=tuple(backends),
         host=str(server.get("host", "127.0.0.1")),
-        port=int(number(server, "port", 18080)),
+        port=server_integer("port", 18080),
         strategy=str(server.get("strategy", SESSION_AFFINITY)),
         health_interval_s=float(number(server, "health_interval_s", 5.0)),
         upstream_timeout_s=float(number(server, "upstream_timeout_s", 300.0)),
         upstream_connect_timeout_s=float(number(server, "upstream_connect_timeout_s", 5.0)),
-        max_connections_per_backend=int(number(server, "max_connections_per_backend", 64)),
-        max_keepalive_connections=int(number(server, "max_keepalive_connections", 16)),
+        max_connections_per_backend=server_integer("max_connections_per_backend", 64),
+        max_keepalive_connections=server_integer("max_keepalive_connections", 16),
         admission=admission,
         deadline=deadline,
         retry=retry,

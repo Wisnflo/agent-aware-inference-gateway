@@ -253,17 +253,21 @@ uv run python -m bench.run_admission_bench --repeat 5 \
 
 uv run python -m bench.run_reliability_bench --repeat 5 \
   --outdir bench/results/week4-reliability
+
+uv run python -m bench.run_soak --outdir bench/results/week4-soak
 ```
 
 The routing benchmark covers 15-session sequential, fixed-seed shuffled and
 no-shared-prefix negatives. The admission benchmark covers baseline, below,
 near, over, far-over and queue-timeout scenarios. The reliability benchmark
 covers normal SSE, short execution deadline, backend stop/restart/failback and
-streaming client cancellation.
+streaming client cancellation. The soak script runs normal, over-capacity and
+disconnect phases for 45 s and samples metrics/health/RSS.
 
 Reference results and their hardware/model caveats are in
-`research/phase-2/implementation/week-4-benchmark.md` and
-`week-4-reliability.md`. The absolute numbers are CPU Qwen2.5-0.5B and must not
+[../research/phase-2/implementation/week-4-benchmark.md](../research/phase-2/implementation/week-4-benchmark.md)
+and
+[../research/phase-2/implementation/week-4-reliability.md](../research/phase-2/implementation/week-4-reliability.md). The absolute numbers are CPU Qwen2.5-0.5B and must not
 be generalized to GPU serving.
 
 ## Safe fault drill
