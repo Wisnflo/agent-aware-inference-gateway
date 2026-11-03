@@ -1,236 +1,40 @@
-# Engineering Review Guide
+# 工程讲解提纲
 
-This file is a study guide, not evidence that the project author has mastered
-the code. Work through each question, run the verification command, and be able
-to modify the code without assistance.
+展示重点是解释代码的行为、限制与验证依据。以下问题可用于准备实习面试；能运行测试不等于已经掌握实现。
 
-Source paths are relative to `gateway/`.
+## 三分钟介绍
 
-## 1. asyncio cancellation semantics
+Agent 多轮请求携带重复上下文，会话亲和可增加同一推理进程上的缓存复用机会，同时可能集中负载。网关在两个本地 llama.cpp 后端前提供路由和有界准入，处理排队、SSE、断连与期限，并用 Prometheus 指标和可控故障测试观察请求生命周期。
 
-**Question:** What happens when a client disconnects while the gateway is
-waiting for upstream headers or streaming SSE? Which coroutine sees
-`CancelledError`, and where is capacity released?
+设计参考 vLLM Router，路由方法属于成熟方案。工程工作主要是资源所有权、异常路径和可复现实验；不声称新算法、生产级安全或 GPU 性能优势。
 
-**Where:** `src/gateway/proxy.py` (`_send_with_disconnect`, `_stream`,
-`_FinalizingStreamingResponse`, `_finalize_stream`), `src/gateway/admission.py`
-(`acquire`, `release`).
+## 用源码回答
 
-**Correctness basis:** `send_task.cancel()` stops the httpx send; the response
-finalizer runs exactly once; `AdmissionTicket.release` is idempotent. Tests
-assert `active=0` after disconnect.
+| 问题 | 代码与验证入口 |
+|---|---|
+| 为什么使用 SHA-256 rendezvous hashing？后端增减时哪些会话迁移？ | `router.py`，`tests/unit/test_router.py` |
+| 先路由再排队有什么代价？为什么 FIFO 按后端保持？ | `admission.py`，`tests/unit/test_admission.py` |
+| 全局和后端上限如何共同约束？释放为什么幂等？ | `AdmissionController`、`AdmissionTicket`，admission HTTP 测试 |
+| `cancel()` 与 send task 已完成同时发生时，谁关闭 Response？ | `proxy.py` 的任务回收与 cleanup，取消交错回归测试 |
+| JSON 正文读取时客户端断开如何发现？下游发送还受期限约束吗？ | `_read_with_disconnect`、`_DeadlineResponse` |
+| 为什么重试排队仍受首次执行期限约束？ | `_execute`、`_acquire`，retry deadline 回归测试 |
+| 为什么只对连接失败重试？头部后切换后端会怎样？ | `_send_with_disconnect`、可靠性 HTTP 测试 |
+| HTTP chunk 和 SSE event 有什么区别？超大事件如何影响指标？ | `sse.py`，分帧和事件上限单元测试 |
+| 为什么票据释放不能依赖 timing 指标和 `aclose()` 成功？ | 异常 timing、重复取消和响应关闭回归测试 |
+| 健康探测为什么去抖？恢复后为什么立即 failback？ | `backends.py`、`router.py`、health 测试 |
+| 请求计数和尝试计数有什么区别？200 SSE 是否成功？ | `metrics.py`、[指标说明](metrics.md) |
+| 如何证明CPU执行与基准可比？如何处理拒绝和截断流？ | `bench/`、[Benchmark 说明](benchmarks.md) |
 
-**Verify:** `uv run pytest -q tests/integration/test_reliability_http.py -k "disconnect or streaming_deadline"`.
+## 最小演示顺序
 
-**Small task:** Add a cancellation test where the client disconnects before the
-fake backend calls `started.set()`. Explain why the outcome is still `499`.
+1. 打开[架构图](assets/architecture.svg)，说明数据路径、健康反馈和容量归属。
+2. 运行 `uv run --locked python -m bench.demo --outdir bench/results/demo`，展示同会话两次请求的后端和缓存统计。
+3. 解释首选后端停止后的健康迁移，以及 session affinity 恢复时立即 failback 的代价。
+4. 展示一项可控回归测试，说明正确行为断言；不要用“复现了缺陷”的 PASS 充当修复成功。
+5. 打开[发布验证记录](release-verification.md)，区分已运行结果、未运行矩阵和已知限制。
 
-## 2. SSE framing across arbitrary HTTP chunks
+## 推荐练习
 
-**Question:** Why can the gateway not treat one HTTP chunk as one SSE event?
-How does the decoder handle CRLF split across chunks?
+选择一个退出路径，在纸上列出 task、Response 和 admission ticket 的所有者，再用测试验证其结束状态。优先检查断连与响应完成同一轮发生、重试等待耗尽期限，以及响应关闭过程中再次取消。
 
-**Where:** `src/gateway/sse.py`, `src/gateway/proxy.py::_stream`.
-
-**Correctness basis:** `SSEEventDecoder` buffers until a blank-line boundary;
-tests feed one byte at a time and split CRLF between chunks.
-
-**Verify:** `uv run pytest -q tests/unit/test_sse.py`.
-
-**Small task:** Add a test for a mixed `\r\n`/`\n` stream and decide whether the
-decoder should normalize it; write down the tradeoff.
-
-## 3. Request and upstream lifecycle
-
-**Question:** When is an upstream `httpx.Response` closed on each path:
-non-stream success, non-stream error, SSE completion, SSE timeout, client
-disconnect, and retry?
-
-**Where:** `src/gateway/proxy.py::handle`, `_execute`, `_fail` equivalents,
-`_finalize_stream`, `_aclose`.
-
-**Correctness basis:** every exit path either calls `_aclose` or the streaming
-finalizer; tests assert no in-flight capacity remains.
-
-**Verify:** `uv run pytest -q tests/integration/test_fake_backend.py tests/integration/test_reliability_http.py`.
-
-**Small task:** Add a logging counter for `aclose` calls and prove exactly one
-close per request in the tests.
-
-## 4. Admission controller invariants
-
-**Question:** Why is `AdmissionTicket.release` idempotent? What prevents
-`active_total > max_in_flight` or `queued_total > max_queue_size`?
-
-**Where:** `src/gateway/admission.py` (`try_acquire`, `acquire`, `release`,
-`_drain`, `stats`).
-
-**Correctness basis:** all transitions are synchronous on the event loop; the
-queue bound is checked before enqueue; `_drain` checks both global and
-per-backend capacity; tests assert peaks and final zero.
-
-**Verify:** `uv run pytest -q tests/unit/test_admission.py tests/integration/test_admission_http.py`.
-
-**Small task:** Change `max_in_flight` at runtime (without restart) in a test
-harness; explain why the current controller does not support it.
-
-## 5. FIFO and cross-backend scheduling
-
-**Question:** Why is FIFO per backend rather than globally strict? What
-happens if the oldest waiter targets a saturated backend while another
-backend has capacity?
-
-**Where:** `src/gateway/admission.py::_drain`.
-
-**Correctness basis:** `_drain` chooses the oldest eligible ticket; a saturated
-backend's head is skipped so another backend can use global capacity. Tests
-assert per-backend FIFO.
-
-**Verify:** `uv run pytest -q tests/unit/test_admission.py -k fifo`.
-
-**Small task:** Implement and test a strict global FIFO variant; compare
-head-of-line blocking in the over-load benchmark.
-
-## 6. Session affinity and rendezvous hashing
-
-**Question:** Why use SHA-256 rendezvous instead of `hash(session) % n`? What
-happens to session mappings when a third backend is added?
-
-**Where:** `src/gateway/router.py`.
-
-**Correctness basis:** golden mapping test; 500-session migration property
-test; no Python hash randomization.
-
-**Verify:** `uv run pytest -q tests/unit/test_router.py`.
-
-**Small task:** Add a fourth backend to the test and verify that only sessions
-won by the new backend move.
-
-## 7. Cache benefit versus load imbalance
-
-**Question:** Why can session affinity improve cache hits yet still be unfair?
-What does the 108/72 backend distribution mean?
-
-**Where:** `src/gateway/router.py`, `bench/run_bench.py`,
-`research/phase-2/implementation/week-4-benchmark.md`.
-
-**Correctness basis:** repeated B0/B1 runs with cold backends; per-backend
-distribution recorded in raw JSON.
-
-**Verify:** run the Week 1 sequential workload with `--repeat 5` and inspect
-`summary.json` and `backend_counts`.
-
-**Small task:** Add per-backend limits to `config.toml`, rerun the same workload,
-and explain why the distribution changes but the cache benefit may not.
-
-## 8. Deadline and retry safety boundaries
-
-**Question:** Which failures are safe to retry, and which are not? Why does
-the execution deadline not reset on retry?
-
-**Where:** `src/gateway/proxy.py::_execute`, `_send_with_disconnect`;
-`src/gateway/config.py` (`DeadlineConfig`, `RetryConfig`).
-
-**Correctness basis:** raw TCP backend tests for connect-before-headers and
-mid-stream close; metadata records retry counts; deadline is an absolute
-timestamp.
-
-**Verify:** `uv run pytest -q tests/integration/test_reliability_http.py -k "retry or close_before or close_mid"`.
-
-**Small task:** Add a test where the replacement backend returns HTTP 500 and
-confirm no further retry occurs.
-
-## 9. Backend health recovery and failback
-
-**Question:** Why do startup probes use threshold 1 while runtime uses
-`failure_threshold`? What is the cost of immediate failback?
-
-**Where:** `src/gateway/backends.py::_probe`, `_record_success`,
-`_record_failure`; `src/gateway/router.py::decide`.
-
-**Correctness basis:** debounce tests with a controllable fake `/health`; real
-A stop/restart experiment in Week 4.
-
-**Verify:** `uv run pytest -q tests/integration/test_reliability_http.py -k health`.
-
-**Small task:** Change recovery to require three successful probes and measure
-the recovery distribution again.
-
-## 10. Prometheus metric semantics
-
-**Question:** Which counters are request-level and which are attempt-level?
-Why is a stream deadline counted as HTTP 200 plus a termination reason?
-
-**Where:** `src/gateway/metrics.py`, `docs/metrics.md`,
-`src/gateway/proxy.py::_finish`, `_finalize_stream`.
-
-**Correctness basis:** `gateway_requests_total` increments once per request in
-`_finish`; retry/admission counters are attempt-level; termination reason is
-exclusive.
-
-**Verify:** run a retry scenario and compare `gateway_requests_total` with
-`gateway_retries_total` and `gateway_admission_admitted_total`.
-
-**Small task:** Add a test that a retried request produces one `status=200`
-request count but two admission counts.
-
-## 11. Benchmark fairness
-
-**Question:** What is held constant between B0 and B1, and why are completed-
-only p50/p95 not overall performance?
-
-**Where:** `bench/run_bench.py`, `bench/workload.py`,
-`bench/run_admission_bench.py`.
-
-**Correctness basis:** same prompts/order/backend args/concurrency; backend and
-gateway restarted per run; rejected/timed-out requests reported separately.
-
-**Verify:** inspect `raw.json` for one B0 and one B1 run and recompute cache hit
-as `Σcache_n / Σ(cache_n+prompt_n)`.
-
-**Small task:** Add a new workload that shares a system prefix across sessions;
-explain why B1 and B2-like routing may differ.
-
-## 12. Fault troubleshooting path
-
-**Question:** A request returns 503 vs 429 vs 504 vs 499: which subsystem owns
-each outcome, and what log/metric would you inspect first?
-
-**Where:** `docs/metrics.md`, `docs/runbook.md`, `src/gateway/proxy.py`.
-
-**Correctness basis:** status mapping table and tests for each path.
-
-**Verify:** `uv run pytest -q tests/integration/test_reliability_http.py`.
-
-**Small task:** Reproduce each status with the fake backend and write down the
-exact metric delta.
-
-## 13. Configuration boundaries
-
-**Question:** Which settings are validated at startup, and what happens with a
-negative queue, an unknown backend in `per_backend`, or a deadline of zero?
-
-**Where:** `src/gateway/config.py`, `tests/unit/test_config.py`.
-
-**Correctness basis:** eager dataclass validation and TOML parsing errors.
-
-**Verify:** `uv run pytest -q tests/unit/test_config.py`.
-
-**Small task:** Add a config case where `execution_timeout_ms` exceeds
-`request_timeout_ms`; explain why total still wins.
-
-## 14. Logging and privacy
-
-**Question:** What is logged per request, and what is deliberately not logged?
-How is a session referenced in logs?
-
-**Where:** `src/gateway/proxy.py` logging calls, `src/gateway/router.py::session_fingerprint`.
-
-**Correctness basis:** logs include route/backend/status/duration/fingerprint;
-no body, prompt, session id or credentials.
-
-**Verify:** run a request and inspect gateway stderr; grep the raw benchmark JSON
-to confirm prompt text is not stored.
-
-**Small task:** Add a log redaction test that asserts a known session id does
-not appear in captured logs.
+讲解 Benchmark 时重新从 raw records 计算缓存率，并同时给出 offered、completed 和错误数量。若没有重跑对应条件，直接说明该结果尚未测量，不用历史报告补数。

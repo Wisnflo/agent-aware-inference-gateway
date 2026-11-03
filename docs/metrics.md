@@ -1,182 +1,84 @@
-# Metrics
+# 指标说明
 
-Endpoint: `GET /metrics`, Prometheus text format.
+`GET /metrics` 输出 Prometheus 文本。指标来自单个网关进程；容量 gauge 从 admission controller 的计数同步，避免在代理的不同分支分别加减。
 
-All metric names are prefixed `gateway_`. Labels are deliberately bounded:
+标签使用固定路由、配置后端和有限结果类型。请求正文、session ID、客户端地址与任意 header 值不作为标签；日志中的会话标识为 SHA-256 的短指纹，仍可用于关联请求。
 
-| Label | Values |
+## 主要指标
+
+| 指标 | 含义与分母 |
 |---|---|
-| `route` | `completion`, `chat_completions` |
-| `backend` | configured backend id (`a`, `b`, …) |
-| `status` | HTTP status code as a string |
-| `kind` | `connect`, `timeout`, `http_status`, `stream`, `other` |
+| `gateway_requests_total{route,status,backend}` | 一次客户端请求的最终 HTTP 结果；重试成功仍只产生一个请求结果 |
+| `gateway_active_requests`、`gateway_in_flight{backend}` | 正在持有执行票据的全局和后端请求数 |
+| `gateway_queue_depth`、`gateway_queue_depth_backend{backend}` | 全局和后端等待请求数 |
+| `gateway_admission_peak_in_flight`、`gateway_admission_peak_queue_depth` | 进程启动以来的容量峰值 |
+| `gateway_admission_admitted_total{backend}` | 获得票据的尝试数，包含重试的新票据 |
+| `gateway_admission_rejected_total{backend}` | 因队列已满而拒绝的次数 |
+| `gateway_admission_timed_out_total{backend}` | 等待达到 queue timeout 的次数 |
+| `gateway_admission_cancelled_total{backend}` | 排队时取消或断连的次数 |
+| `gateway_upstream_errors_total{backend,kind}` | 失败的上游尝试数；一次客户端请求可能先失败再重试成功 |
+| `gateway_retries_total{backend,reason}` | 连接失败后启动替代尝试的次数 |
+| `gateway_retry_results_total{from_backend,to_backend,result}` | 替代尝试的结果 |
+| `gateway_execution_timeouts_total{backend,kind}` | 达到 request 或 execution deadline 的次数 |
+| `gateway_client_cancelled_total{route,stage}` | 客户端取消，阶段含 queued、connecting、body、streaming |
+| `gateway_upstream_disconnects_total{backend,stage}` | connect、body 或 stream 阶段的上游网络或协议异常 |
+| `gateway_client_disconnects_total{route}` | 流式响应的客户端断连，属于上一项客户端取消指标的流式子集 |
+| `gateway_stream_terminations_total{backend,reason}` | SSE 以 completed、client_disconnect、upstream_error 或 deadline 结束 |
+| `gateway_health_checks_total{backend,result}` | 健康探测的成功和失败次数 |
+| `gateway_backend_health{backend}` | 经启动检查或运行时去抖后的健康状态，1 为可路由，0 为已摘除 |
+| `gateway_backend_removed_total{backend}`、`gateway_backend_restored_total{backend}` | 运行时健康摘除和恢复次数，不含启动转换 |
+| `gateway_routing_failovers_total{from_backend,to_backend}` | 路由时因首选不健康而选择备用后端的次数 |
 
-No session id, prompt text, request id, client address or header value is used
-as a label. Session ids appear in logs only as an 8-hex SHA-256 fingerprint.
+`gateway_requests_total` 与 admission、retry、upstream error 的分母不同，不能直接相加计算总请求数。`/health` 和 `/metrics` 本身不计为推理请求。
 
-## Counters
+## 时间分布
 
-| Metric | Definition | Increment point |
-|---|---|---|
-| `gateway_requests_total{route,status,backend}` | Proxy requests that reached a routing decision, labelled by the final status returned to the client. | Exactly once per request in `Proxy._finish`. |
-| `gateway_upstream_errors_total{backend,kind}` | Failed upstream exchanges. | Once per failed exchange: connect error/timeout, read error, mid-stream error, or an upstream 5xx response. |
-| `gateway_client_disconnects_total{route}` | Streaming responses whose client went away and whose response task was cancelled. | In the streaming generator's cleanup path. |
-| `gateway_sse_events_total{backend}` | Complete SSE events observed on forwarded streams. | At stream end, by the number of events decoded for metrics. |
-| `gateway_prompt_tokens_cached_total{backend}` | Sum of llama.cpp `timings.cache_n` (prompt tokens served from prefix cache). | When a timing object is observed (final SSE event or JSON body). |
-| `gateway_prompt_tokens_fresh_total{backend}` | Sum of llama.cpp `timings.prompt_n` (tokens that required prefill). | Same. |
-| `gateway_prompt_tokens_total{backend}` | Sum of `cache_n + prompt_n`. | Same. |
-| `gateway_admission_admitted_total{backend}` | Requests granted execution capacity, immediately or after waiting. | Once per successful admission, before the upstream request is sent. |
-| `gateway_admission_rejected_total{backend}` | Requests rejected because the bounded queue was full. | Once per `queue_full` rejection. |
-| `gateway_admission_timed_out_total{backend}` | Requests that exceeded `queue_timeout_ms` while waiting. | Once per `queue_timeout` outcome. |
-| `gateway_admission_cancelled_total{backend}` | Waiting requests cancelled or abandoned by the client before admission. | Once per waiting cancellation/disconnect. |
-
-## Gauges
-
-| Metric | Definition |
+| Histogram | 起止点 |
 |---|---|
-| `gateway_in_flight{backend}` | Admitted requests currently holding execution capacity for that backend. |
-| `gateway_active_requests` | Admitted requests currently holding execution capacity (global). |
-| `gateway_queue_depth` | Requests currently waiting in admission queues (global). |
-| `gateway_queue_depth_backend{backend}` | Requests waiting in that backend's FIFO queue. |
-| `gateway_admission_peak_in_flight` | Highest observed admitted count since process start. |
-| `gateway_admission_peak_queue_depth` | Highest observed queue depth since process start. |
-| `gateway_backend_health{backend}` | 1 if the last `/health` probe returned 200, 0 otherwise. Unset until the first probe completes. |
+| `gateway_request_duration_seconds{route,backend}` | 处理请求开始至响应结束；JSON 包括下游发送，SSE 包括流式发送及清理 |
+| `gateway_upstream_duration_seconds{route,backend}` | JSON 从发送上游到正文读完；SSE 在流式结束时记录，包含交错进行的下游转发及清理时间 |
+| `gateway_ttft_seconds{backend}` | 请求开始到首个非空生成内容事件被网关观察到，包含排队 |
+| `gateway_queue_wait_seconds{backend}` | 从票据到达到准入，仅对获准尝试记录 |
+| `gateway_backend_execution_seconds{route,backend}` | 从准入到票据释放；JSON 在读完正文后释放，SSE 在流结束时释放 |
 
-All capacity gauges are derived from `AdmissionController.stats()` by
-`sync_capacity_metrics`, so they cannot drift from the authoritative counters.
+`queue_wait_seconds` 的起点位于请求体读取和路由之后；它不是客户端观察到的全部等待时间。JSON 下游发送阶段仍受固定期限约束，但不再占用后端执行名额，因此 total duration 不总是 queue + backend execution。
 
-## Histograms
+`request_duration - upstream_duration` 只能作为附加开销的近似值。SSE 的读写交错，两个分布包含重叠阶段；这组差值不是路由函数耗时或纯代理 CPU 开销。路由 Benchmark 另提供客户端直接请求后端与经过网关的比较，也须报告对应环境和样本数。
 
-| Metric | Definition | Buckets |
-|---|---|---|
-| `gateway_request_duration_seconds{route,backend}` | From the gateway receiving the request to the response ending (last streamed byte sent, or error returned). Includes queue wait. | 5 ms … 60 s |
-| `gateway_upstream_duration_seconds{route,backend}` | From just before sending upstream to the upstream response being fully read. | 5 ms … 60 s |
-| `gateway_ttft_seconds{backend}` | From receiving a streaming request to the first event containing non-empty generated content. Includes queue wait. | 5 ms … 60 s |
-| `gateway_queue_wait_seconds{backend}` | From request arrival to admission. Observed for every admitted request; 0 for immediate admission. | 1 ms … 30 s |
-| `gateway_backend_execution_seconds{route,backend}` | From admission to request end. Excludes queue wait. | 5 ms … 60 s |
+## SSE 与协议完成
 
-### Queue, execution and total latency
+`gateway_stream_terminations_total{reason="completed"}` 表示网关正常读到上游 EOF，没有记录到断连、期限或异常。它不验证生成协议的结束事件，因此不能单独用来计算成功生成数。
 
-- **Queue wait** = arrival → admitted.
-- **Backend execution** = admitted → request end (upstream + forwarding).
-- **Total request latency** = arrival → request end.
+原生 llama.cpp Benchmark 要求完整 `stop: true` 事件；OpenAI 兼容流的 `[DONE]` 由上游决定。网关不为异常结束补写完成标记。`gateway_sse_events_total` 记录指标解析器观察到的事件，无法替代客户端完成检查。
 
-Total is approximately queue + execution + pre-admission routing/body-read
-overhead. Rejected and timed-out requests have only `gateway_request_duration`
-and `gateway_requests_total{status="429"}`; they intentionally do not appear in
-queue-wait or execution histograms.
+SSE 指标解析每个事件最多保留 64 KiB。超限事件会跳过到下一分隔符，以限制解析内存；原始字节继续转发，因此超大事件中的内容或 token timing 可能不进入指标。
 
-For non-streaming requests, upstream duration ends after `aread()`; for
-streaming requests it ends after the last chunk is read. Request duration ends
-after the response generator finishes, so it includes forwarding time to the
-client.
+## 缓存统计
 
-### Gateway overhead estimate
+| 指标 | 来源 |
+|---|---|
+| `gateway_prompt_tokens_cached_total{backend}` | 有效 `timings.cache_n` 累加 |
+| `gateway_prompt_tokens_fresh_total{backend}` | 有效 `timings.prompt_n` 累加 |
+| `gateway_prompt_tokens_total{backend}` | 两者之和 |
 
-`gateway_request_duration_seconds_sum - gateway_upstream_duration_seconds_sum`
-divided by the request count over the same window is the benchmark's
-"gateway overhead" estimate. It covers routing, header filtering, reading the
-request body, the extra loopback hop, and forwarding the last chunk. It is an
-estimate, not a pure function-level profile. `bench/run_bench.py` also runs a
-direct-backend vs gateway probe for a second, client-side measurement.
+非整数和负数不计入 token 指标。统计异常被隔离，不改变响应控制流程；极端数值不应作为有效测量依据。OpenAI 兼容 `usage` 结构不等同于原生 llama.cpp timing；缺少 timing 时，这组计数不能代表全部请求的 token 数。
 
-## Cache hit ratio
-
-```
-cache_hit_pct = 100 * Σ cache_n / Σ (cache_n + prompt_n)
+```text
+cache_hit_pct = 100 × Σcache_n / Σ(cache_n + prompt_n)
 ```
 
-This matches the Phase 2.1 direct-backend definition, so values are comparable.
-The denominator counts prompt tokens actually presented to the backend in that
-run, not model context length.
+不要用缓存 token 除以后端的 fresh-prefill counter。引擎版本改变后，应从原始事件与后端快照重新核对计数语义。比较不同 workload 时还需报告提示长度、冷会话数与后端分布。
 
-Do not compare this ratio across different prompt lengths or different numbers
-of cold sessions without also reporting the backend request distribution.
+## 状态码与失败类型
 
-## Relationship to llama.cpp counters
-
-llama.cpp exposes `llamacpp:prompt_tokens_total`,
-`llamacpp:prompt_tokens_cached_total`, `llamacpp:tokens_predicted_total` and
-`llamacpp:requests_processing` per process. The benchmark snapshots these
-before/after each run.
-
-Measured semantics in the pinned llama.cpp version (Week 1 benchmark):
-
-- `gateway_prompt_tokens_cached_total` delta matched
-  `llamacpp:prompt_tokens_cached_total` delta exactly (12,940 and 19,410 for
-  the sequential B0/B1 runs).
-- `llamacpp:prompt_tokens_total` counts **fresh prefill only**, so it matches
-  `gateway_prompt_tokens_fresh_total` (13,480 / 7,010), not
-  `gateway_prompt_tokens_total` (which adds cache hits: 26,420 in both).
-- `llamacpp:tokens_predicted_total` matched the 60 generated tokens per run.
-
-Therefore cache hit ratio must always be computed as
-`cache_n / (cache_n + prompt_n)` and never as
-`cached_total / llamacpp:prompt_tokens_total`; the latter would exceed 100%.
-The benchmark stores both vantage points so this reconciliation is auditable.
-`gateway_prompt_tokens_total` is a gateway-computed convenience counter with no
-single llama.cpp counterpart.
-
-## Admission status codes
-
-| Condition | HTTP | `error.type` | Counted as |
-|---|---|---|---|
-| Queue full | 429 | `queue_full` | `gateway_admission_rejected_total`, `gateway_requests_total{status="429"}` |
-| Queue wait timeout | 429 | `queue_timeout` | `gateway_admission_timed_out_total`, `gateway_requests_total{status="429"}` |
-| Client gone while queued | 499 (not sent) | n/a | `gateway_admission_cancelled_total`, `gateway_requests_total{status="499"}` |
-
-Both 429 responses carry `Retry-After: 1` and `error.retry_after_ms`. They never
-increment `gateway_upstream_errors_total`, because no upstream exchange
-occurred.
-
-Admitted responses include `X-Gateway-Queue-Ms` for per-request queue-wait
-inspection; it is not a metric label.
-
-## Reliability metrics (Week 3)
-
-| Metric | Type | Definition |
+| 情况 | HTTP 状态 | 主要观测 |
 |---|---|---|
-| `gateway_execution_timeouts_total{backend,kind}` | counter | Requests that hit a total/execution deadline. `kind` is `request_deadline` or `execution_timeout` (including connect/read phases). Queue-specific timeouts remain in `gateway_admission_timed_out_total`. |
-| `gateway_client_cancelled_total{route,stage}` | counter | Requests cancelled by the client; `stage` is `queued`, `connecting`, `body` or `streaming`. |
-| `gateway_upstream_disconnects_total{backend,stage}` | counter | Upstream transport/protocol failures; `stage` is `connect`, `body` or `stream`. |
-| `gateway_stream_terminations_total{backend,reason}` | counter | Why an SSE stream ended: `completed`, `client_disconnect`, `upstream_error`, `deadline`. Exactly one reason per stream. |
-| `gateway_health_checks_total{backend,result}` | counter | Health probe outcomes (`success`/`failure`). |
-| `gateway_backend_removed_total{backend}` | counter | Health-transition removals (startup transitions excluded). |
-| `gateway_backend_restored_total{backend}` | counter | Health-transition restorations (startup transitions excluded). |
-| `gateway_routing_failovers_total{from_backend,to_backend}` | counter | Requests routed away from an unhealthy preferred backend before dispatch. |
-| `gateway_retries_total{backend,reason}` | counter | Retry attempts started after a safe pre-dispatch connect failure. |
-| `gateway_retry_results_total{from_backend,to_backend,result}` | counter | Replacement attempt outcome: `success`, `http_error`, `failed`, `rejected`, `timed_out`, `deadline`, `cancelled`, `no_backend`. |
+| 队列已满 | 429 `queue_full` | admission rejected |
+| 排队超时 | 429 `queue_timeout` | admission timed out |
+| 请求期限或执行期限耗尽，头部未提交 | 504 `request_deadline` 或 `execution_timeout` | execution timeouts |
+| 无健康后端 | 503 `no_healthy_backend` | request result、backend health |
+| 可重试连接失败耗尽 | 502 `upstream_connect_error` | upstream errors、retry results |
+| 客户端已离开 | 内部记 499 或已提交状态 | client cancelled；499 不发给已离开的客户端 |
+| SSE 头部提交后出错或超时 | 保持已提交状态，常为 200 | stream termination、完整结束事件是否存在 |
 
-### Deadline vs cancellation vs overload
-
-| Outcome | HTTP | Primary counter |
-|---|---|---|
-| Queue full | 429 `queue_full` | `gateway_admission_rejected_total` |
-| Queue wait timeout | 429 `queue_timeout` | `gateway_admission_timed_out_total` |
-| Total request deadline while queued | 504 `request_deadline` | `gateway_execution_timeouts_total{kind="request_deadline"}` |
-| Execution/connect deadline | 504 `execution_timeout` | `gateway_execution_timeouts_total{kind="execution_timeout"}` |
-| Client cancellation | 499 / stream end | `gateway_client_cancelled_total` |
-| No healthy backend | 503 `no_healthy_backend` | `gateway_requests_total{status="503",backend="none"}` |
-
-`gateway_requests_total` counts exactly one final result per client request.
-`gateway_retries_total` and `gateway_upstream_errors_total` are attempt-level:
-one request can have a failed first attempt and a successful second attempt,
-so those counters are not request counts. `gateway_admission_admitted_total`
-is also attempt-level (one per acquired ticket, including a retry ticket).
-
-### Cancellation evidence levels
-
-- Fake-backend tests prove gateway task termination and upstream connection
-  closure deterministically.
-- Real llama.cpp runs additionally show `llamacpp:requests_processing`
-  returning to zero after a client disconnect; this is supporting evidence, not
-  proof of internal KV/slot cancellation.
-
-## Intentional omissions
-
-- No per-session latency or cache metric: that would create unbounded label
-  cardinality. Session-level analysis belongs in benchmark raw data.
-- No token-per-second gauge: throughput is computed from counters over a
-  benchmark window, not from a scrape-time derivative.
-- No prompt/body logging: request bodies may contain user data. The gateway
-  logs only route, backend, status, duration and a session fingerprint.
+429 携带 `Retry-After: 1` 和 `error.retry_after_ms`。Admitted 响应携带 `X-Gateway-Queue-Ms`；这些响应字段不作为指标标签。

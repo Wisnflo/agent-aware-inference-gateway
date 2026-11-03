@@ -1,0 +1,26 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  no-model-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.15"
+          enable-cache: true
+      - name: Install locked development environment
+        run: uv sync --locked --python "${{ matrix.python-version }}" --group dev
+      - name: Run unit, fake HTTP, raw HTTP and benchmark regression tests
+        run: uv run --locked pytest tests bench/tests -m "not real_backend"

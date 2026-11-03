@@ -1,0 +1,32 @@
+---
+config:
+  theme: neutral
+  htmlLabels: false
+  fontFamily: Arial, sans-serif
+  flowchart:
+    curve: linear
+    padding: 16
+    nodeSpacing: 36
+    rankSpacing: 32
+  themeVariables:
+    fontFamily: Arial, sans-serif
+    fontSize: 16px
+---
+flowchart LR
+  client["Client request<br/>X-Session-ID"]
+  response["Client response<br/>JSON or incremental SSE"]
+    router["Router<br/>round robin or affinity"]
+    admission["Admission<br/>caps + bounded FIFO"]
+    proxy["Proxy<br/>HTTPX pools + deadlines"]
+    health["Health<br/>probes + debounce"]
+    observe["Metrics<br/>/health + /metrics"]
+    router --> admission --> proxy
+    health -. healthy set .-> router
+    admission -. capacity .-> observe
+    proxy -. outcomes .-> observe
+  a["llama-server A<br/>same model"]
+  b["llama-server B<br/>same model"]
+  client --> router
+  proxy --> a
+  proxy --> b
+  proxy ==> response

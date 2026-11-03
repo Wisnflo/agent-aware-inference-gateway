@@ -23,6 +23,8 @@ import httpx
 
 from bench.run_bench import (
     PROJECT_ROOT,
+    BACKEND_ARGS,
+    asset_metadata,
     ProcessHandle,
     backend_snapshot,
     fetch_text,
@@ -37,6 +39,7 @@ from bench.run_bench import (
 )
 from gateway.config import load_config
 from gateway.sse import SSEEventDecoder
+from bench.run_reliability_bench import stream_request
 
 SHARED_PREFIX = (
     "You are a concise travel assistant. Respect the budget and keep answers "
@@ -64,12 +67,17 @@ class WorkerStats:
     timed_out: int = 0
     cancelled: int = 0
     errors: int = 0
+    error_types: dict[str, int] = field(default_factory=dict)
     durations: list[float] = field(default_factory=list)
     first_contents: list[float] = field(default_factory=list)
 
-    def record(self, status: int | None, duration: float, first: float | None):
+    def record(
+        self, status: int | None, duration: float, first: float | None,
+        *, completed: bool = False, intentional_cancel: bool = False,
+        error: str | None = None,
+    ):
         self.offered += 1
-        if status == 200:
+        if status == 200 and completed and error is None:
             self.completed += 1
             self.durations.append(duration)
             if first is not None:
@@ -78,10 +86,12 @@ class WorkerStats:
             self.rejected += 1
         elif status == 504:
             self.timed_out += 1
-        elif status == 499 or status is None:
+        elif intentional_cancel and error is None:
             self.cancelled += 1
         else:
             self.errors += 1
+            kind = error or ("incomplete_sse" if status == 200 else f"http_{status}")
+            self.error_types[kind] = self.error_types.get(kind, 0) + 1
 
 
 async def normal_worker(
@@ -96,33 +106,13 @@ async def normal_worker(
             SHARED_PREFIX
             + f" Worker {worker_id} request {index}: give one short sentence."
         )
-        started = time.perf_counter()
-        first = None
-        status = None
-        try:
-            async with client.stream(
-                "POST",
-                "/completion",
-                json={
-                    "prompt": prompt,
-                    "n_predict": 1,
-                    "temperature": 0,
-                    "stream": True,
-                    "cache_prompt": True,
-                },
-                headers={"X-Session-ID": f"soak-normal-{worker_id}-{index}"},
-            ) as response:
-                status = response.status_code
-                decoder = SSEEventDecoder()
-                async for chunk in response.aiter_raw():
-                    for event in decoder.feed(chunk):
-                        obj = event.json()
-                        if first is None and isinstance(obj, dict) and obj.get("content"):
-                            first = time.perf_counter() - started
-                decoder.flush()
-        except Exception:  # noqa: BLE001 - counted, not hidden
-            status = None
-        stats.record(status, time.perf_counter() - started, first)
+        result = await stream_request(
+            client, prompt, session=f"soak-normal-{worker_id}-{index}"
+        )
+        stats.record(
+            result.status, result.total_s, result.first_content_s,
+            completed=result.completed, error=result.error,
+        )
         index += 1
 
 
@@ -137,29 +127,35 @@ async def disconnect_worker(
         prompt = SHARED_PREFIX + f" Disconnect worker {worker_id} request {index}."
         started = time.perf_counter()
         status = None
+        intentional_cancel = False
+        completed = False
+        error = None
         try:
             async with client.stream(
-                "POST",
-                "/completion",
-                json={
-                    "prompt": prompt,
-                    "n_predict": 32,
-                    "temperature": 0,
-                    "stream": True,
-                    "cache_prompt": True,
-                },
+                "POST", "/completion",
+                json={"prompt": prompt, "n_predict": 32, "temperature": 0,
+                      "stream": True, "cache_prompt": True},
                 headers={"X-Session-ID": f"soak-cancel-{worker_id}-{index}"},
             ) as response:
                 status = response.status_code
+                decoder = SSEEventDecoder()
                 async for chunk in response.aiter_raw():
-                    if b"\n\n" in chunk:
+                    events = decoder.feed(chunk)
+                    if status == 200 and events:
+                        completed = any(
+                            isinstance(event.json(), dict)
+                            and event.json().get("stop") is True for event in events
+                        )
+                        intentional_cancel = not completed
                         break
-            # Leaving the context closes the client connection.
-            if status == 200:
-                status = 499  # client aborted after the first event
-        except Exception:  # noqa: BLE001
-            status = None
-        stats.record(status, time.perf_counter() - started, None)
+        except httpx.TimeoutException as exc:
+            error = f"transport_timeout:{type(exc).__name__}"
+        except Exception as exc:  # noqa: BLE001 - not an intentional cancellation
+            error = f"transport_error:{type(exc).__name__}"
+        stats.record(
+            status, time.perf_counter() - started, None, completed=completed,
+            intentional_cancel=intentional_cancel, error=error,
+        )
         index += 1
 
 
@@ -244,7 +240,10 @@ async def run_phase(
         asyncio.create_task(worker_fn(client, index, stop_at, stats[index]))
         for index in range(workers)
     ]
-    await asyncio.gather(*tasks, return_exceptions=True)
+    outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+    failures = [value for value in outcomes if isinstance(value, BaseException)]
+    if failures:
+        raise RuntimeError(f"{name} worker failed: {failures[0]!r}")
     return stats
 
 
@@ -262,6 +261,10 @@ def phase_summary(phase: str, stats: list[WorkerStats], wall_s: float) -> dict:
         "timed_out": sum(item.timed_out for item in stats),
         "cancelled": sum(item.cancelled for item in stats),
         "errors": sum(item.errors for item in stats),
+        "error_types": {
+            key: sum(item.error_types.get(key, 0) for item in stats)
+            for key in sorted({key for item in stats for key in item.error_types})
+        },
         "goodput_req_s": round(completed / wall_s, 4) if wall_s else None,
         "duration_ms_p50": percentile([1000 * value for value in durations], 0.50),
         "duration_ms_p95": percentile([1000 * value for value in durations], 0.95),
@@ -383,6 +386,8 @@ async def async_main(outdir: Path) -> None:
         gateway_delta = final["requests_total"] - (first_requests or 0)
         summary = {
             "created_at": now_iso(),
+            "assets": asset_metadata(),
+            "backend_args": BACKEND_ARGS,
             "config": str(config_path),
             "phases": phase_results,
             "idle_wall_s": round(idle_wall, 3),

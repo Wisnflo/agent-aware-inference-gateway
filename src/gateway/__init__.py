@@ -1,8 +1,7 @@
-"""Agent-aware inference gateway (Week 1 scope).
+"""Local asyncio inference gateway with session routing and bounded admission.
 
-This package implements a small, auditable asyncio gateway in front of two
-local llama.cpp servers.  It deliberately does NOT implement bounded queues,
-retries, failover or cancellation fault injection yet; those are later gates.
+Includes request/execution deadlines, safe connection retries, health failover,
+and HTTP/SSE cancellation handling for static llama.cpp backends.
 """
 
 __version__ = "0.1.0"

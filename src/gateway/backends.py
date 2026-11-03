@@ -10,6 +10,7 @@ Health model:
 * a business HTTP 5xx is *not* treated as backend death (it may be
   request-specific).  Only transport failures and failed health probes count.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -17,11 +18,12 @@ import logging
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 from typing import Callable
 
 import httpx
 
-from .config import BackendConfig, ConfigError, GatewayConfig
+from .config import ConfigError, GatewayConfig
 
 logger = logging.getLogger("gateway.backends")
 
@@ -29,6 +31,16 @@ HEALTH_TIMEOUT_S = 2.0
 
 HealthChangeCallback = Callable[["Backend", bool, str], None]
 ProbeCallback = Callable[[str, bool], None]
+
+
+class _NoCookiePolicy(DefaultCookiePolicy):
+    """Inference clients must not retain state from other downstream clients."""
+
+    def set_ok(self, cookie, request) -> bool:
+        return False
+
+    def return_ok(self, cookie, request) -> bool:
+        return False
 
 
 @dataclass
@@ -78,7 +90,9 @@ class BackendPool:
 
     def healthy_ids(self) -> set[str]:
         """Unknown (never probed) backends are eligible; explicit False is not."""
-        return {backend.id for backend in self._backends if backend.healthy is not False}
+        return {
+            backend.id for backend in self._backends if backend.healthy is not False
+        }
 
     def has_healthy(self) -> bool:
         return any(backend.healthy is not False for backend in self._backends)
@@ -109,6 +123,7 @@ class BackendPool:
                     limits=limits,
                     timeout=timeout,
                     follow_redirects=False,
+                    cookies=CookieJar(policy=_NoCookiePolicy()),
                 )
         await self.check_health(startup=True)
         self._health_task = asyncio.create_task(
@@ -160,7 +175,9 @@ class BackendPool:
                 self._record_success(backend, startup=startup)
             else:
                 self._record_failure(
-                    backend, backend.last_error or "health probe failed", startup=startup
+                    backend,
+                    backend.last_error or "health probe failed",
+                    startup=startup,
                 )
             if self.on_probe is not None:
                 self.on_probe(backend.id, success)

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import platform
@@ -38,10 +39,10 @@ from prometheus_client.parser import text_string_to_metric_families
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE = Path(
-    os.environ.get("GATEWAY_WORKSPACE", Path.home() / "PersonalHub" / "workspace")
+    os.environ.get("GATEWAY_WORKSPACE", Path.home() / "gateway-assets")
 )
 LLAMA_SERVER = Path(
-    os.environ.get("LLAMA_SERVER", WORKSPACE / "tools/llama.cpp/build/bin/llama-server")
+    os.environ.get("LLAMA_SERVER", WORKSPACE / "llama.cpp/build/bin/llama-server")
 )
 MODEL = Path(
     os.environ.get("GATEWAY_MODEL", WORKSPACE / "models/qwen2.5-0.5b-instruct-q4_0.gguf")
@@ -54,7 +55,11 @@ from gateway.sse import SSEEventDecoder, first_content  # noqa: E402
 from bench.workload import SEED, WORKLOADS, WorkloadRequest, build_workload  # noqa: E402
 
 STRATEGIES = {"b0": "round_robin", "b1": "session_affinity"}
-BACKEND_ARGS = ["-c", "4096", "-n", "16", "-t", "4", "--metrics", "--no-webui"]
+BACKEND_ARGS = [
+    "-c", "4096", "-n", "16", "-t", "4", "--threads-batch", "4",
+    "-ngl", "0", "--device", "none", "--no-op-offload",
+    "--parallel", "1", "--metrics", "--no-webui",
+]
 
 
 @dataclass
@@ -64,20 +69,22 @@ class ProcessHandle:
     log: object
 
     async def stop(self) -> None:
-        if self.process.poll() is None:
-            try:
-                os.killpg(self.process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                await asyncio.to_thread(self.process.wait, 8)
-            except subprocess.TimeoutExpired:
+        try:
+            if self.process.poll() is None:
                 try:
-                    os.killpg(self.process.pid, signal.SIGKILL)
+                    os.killpg(self.process.pid, signal.SIGTERM)
                 except ProcessLookupError:
                     pass
-                await asyncio.to_thread(self.process.wait, 3)
-        self.log.close()
+                try:
+                    await asyncio.to_thread(self.process.wait, 8)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(self.process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    await asyncio.to_thread(self.process.wait, 3)
+        finally:
+            self.log.close()
 
 
 def now_iso() -> str:
@@ -96,10 +103,14 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
-async def wait_http(url: str, timeout: float = 120.0) -> None:
+async def wait_http(
+    url: str, timeout: float = 120.0, process: subprocess.Popen | None = None,
+) -> None:
     deadline = time.monotonic() + timeout
     async with httpx.AsyncClient(timeout=2) as client:
         while time.monotonic() < deadline:
+            if process is not None and process.poll() is not None:
+                raise RuntimeError(f"process exited with {process.returncode} waiting for {url}")
             try:
                 response = await client.get(url)
                 if response.status_code == 200:
@@ -111,36 +122,48 @@ async def wait_http(url: str, timeout: float = 120.0) -> None:
 
 
 async def start_backend(config_backend, run_id: str, log_dir: Path) -> ProcessHandle:
-    port = urlparse(config_backend.url).port
+    parsed = urlparse(config_backend.url)
+    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"}:
+        raise RuntimeError("benchmark backend processes require local HTTP URLs")
+    port = parsed.port
     if port is None:
         raise RuntimeError(f"backend url has no port: {config_backend.url}")
     if port_open(port):
         raise RuntimeError(
             f"port {port} is already in use; refusing to kill an unknown process"
         )
+    if not LLAMA_SERVER.is_file() or not os.access(LLAMA_SERVER, os.X_OK):
+        raise RuntimeError(f"llama-server not executable: {LLAMA_SERVER}")
+    if not MODEL.is_file():
+        raise RuntimeError(f"model not found: {MODEL}")
+    log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"backend-{run_id}-{port}.log"
     log = open(log_path, "w")
-    process = subprocess.Popen(
-        [
-            str(LLAMA_SERVER),
-            "-m",
-            str(MODEL),
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            *BACKEND_ARGS,
-        ],
-        stdout=log,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
+    try:
+        process = subprocess.Popen(
+            [
+                str(LLAMA_SERVER),
+                "-m",
+                str(MODEL),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                *BACKEND_ARGS,
+            ],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except BaseException:
+        log.close()
+        raise
     handle = ProcessHandle(
         name=f"backend-{config_backend.id}", process=process, log=log
     )
     try:
-        await wait_http(f"{config_backend.base_url}/health")
-    except Exception:
+        await wait_http(f"{config_backend.base_url}/health", process=process)
+    except BaseException:
         await handle.stop()
         raise
     return handle
@@ -151,7 +174,7 @@ async def start_backends(config, run_id: str, log_dir: Path) -> list[ProcessHand
     try:
         for backend in config.backends:
             handles.append(await start_backend(backend, run_id, log_dir))
-    except Exception:
+    except BaseException:
         await stop_all(handles)
         raise
     return handles
@@ -167,39 +190,51 @@ async def start_gateway(
 ) -> ProcessHandle:
     if port_open(port):
         raise RuntimeError(f"gateway port {port} is already in use")
+    log_dir.mkdir(parents=True, exist_ok=True)
     log = open(log_dir / f"gateway-{run_id}.log", "w")
-    process = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "gateway",
-            "--config",
-            str(config_path),
-            "--strategy",
-            strategy,
-            "--port",
-            str(port),
-            "--log-level",
-            "warning",
-            *(extra_args or []),
-        ],
-        cwd=str(PROJECT_ROOT),
-        stdout=log,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
+    try:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "gateway",
+                "--config",
+                str(config_path),
+                "--strategy",
+                strategy,
+                "--port",
+                str(port),
+                "--log-level",
+                "warning",
+                *(extra_args or []),
+            ],
+            cwd=str(PROJECT_ROOT),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except BaseException:
+        log.close()
+        raise
     handle = ProcessHandle(name=f"gateway-{run_id}", process=process, log=log)
     try:
-        await wait_http(f"http://127.0.0.1:{port}/health", timeout=30)
-    except Exception:
+        await wait_http(f"http://127.0.0.1:{port}/health", timeout=30, process=process)
+    except BaseException:
         await handle.stop()
         raise
     return handle
 
 
 async def stop_all(handles: list[ProcessHandle]) -> None:
+    # Attempt every owned process even if one fails to stop.
+    failures = []
     for handle in reversed(handles):
-        await handle.stop()
+        try:
+            await handle.stop()
+        except Exception as exc:
+            failures.append(f"{handle.name}: {type(exc).__name__}: {exc}")
+    if failures:
+        raise RuntimeError("process cleanup failed: " + "; ".join(failures))
 
 
 def parse_prometheus(text: str) -> dict[tuple[str, tuple], float]:
@@ -282,6 +317,7 @@ async def run_request(
         "predicted_n": None,
         "predicted_ms": None,
         "success": False,
+        "stream_completed": False,
         "error": None,
     }
     try:
@@ -301,6 +337,8 @@ async def run_request(
                 for event in decoder.feed(chunk):
                     record["sse_events"] += 1
                     obj = event.json()
+                    if isinstance(obj, dict) and obj.get("stop") is True:
+                        record["stream_completed"] = True
                     if record["first_content_s"] is None and first_content(obj) is not None:
                         record["first_content_s"] = round(
                             time.perf_counter() - started, 6
@@ -314,9 +352,9 @@ async def run_request(
                         record["predicted_ms"] = timings.get("predicted_ms")
             for event in decoder.flush():
                 record["sse_events"] += 1
-        record["success"] = record["cache_n"] is not None
+        record["success"] = record["stream_completed"] and record["cache_n"] is not None
         if not record["success"]:
-            record["error"] = "no timings in stream"
+            record["error"] = "incomplete SSE or no timings in completed stream"
     except Exception as exc:  # noqa: BLE001 - recorded as benchmark evidence
         record["error"] = f"{type(exc).__name__}: {exc}"
     record["duration_s"] = round(time.perf_counter() - started, 6)
@@ -634,15 +672,33 @@ async def timed_post(
     return time.perf_counter() - started
 
 
+def asset_metadata(binary: Path | None = None, model: Path | None = None) -> dict:
+    """Record the actual files selected by the environment, never a reference hash."""
+    binary = binary or LLAMA_SERVER
+    model = model or MODEL
+    def digest(path: Path) -> str:
+        with path.open("rb") as handle:
+            return hashlib.file_digest(handle, "sha256").hexdigest()
+    metadata = {
+        "llama_server": str(binary), "binary_sha256": digest(binary),
+        "model": str(model), "model_sha256": digest(model),
+    }
+    try:
+        version = subprocess.run(
+            [str(binary), "--version"], capture_output=True, text=True, timeout=10, check=True,
+        )
+        metadata["llama_server_version"] = (version.stdout + version.stderr).strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        metadata["llama_server_version_error"] = f"{type(exc).__name__}: {exc}"
+    return metadata
+
+
 def write_meta(args, config, outdir: Path) -> None:
     meta = {
         "created_at": now_iso(),
         "host": platform.platform(),
         "python": sys.version,
-        "llama_server": str(LLAMA_SERVER),
-        "llama_cpp_commit": "785322d17f2d51e5185cf996a1f4e46d87640841",
-        "model": str(MODEL),
-        "model_sha256": "7671c0c304e6ce5a7fc577bcb12aba01e2c155cc2efd29b2213c95b18edaf6ed",
+        **asset_metadata(),
         "backend_args": BACKEND_ARGS,
         "backends": [asdict(backend) for backend in config.backends],
         "repeat": args.repeat,

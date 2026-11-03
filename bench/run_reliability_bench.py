@@ -26,6 +26,8 @@ import httpx
 
 from bench.run_bench import (
     PROJECT_ROOT,
+    BACKEND_ARGS,
+    asset_metadata,
     ProcessHandle,
     backend_snapshot,
     fetch_text,
@@ -94,46 +96,59 @@ class StreamResult:
     events: int
     raw: bytes
     queue_ms: float | None
+    completed: bool = False
+    error: str | None = None
 
 
 async def stream_request(
-    client: httpx.AsyncClient, prompt: str, *, n_predict: int = 1
+    client: httpx.AsyncClient, prompt: str, *, n_predict: int = 1,
+    session: str | None = None,
 ) -> StreamResult:
+    """Measure native llama.cpp SSE; only a framed ``stop=true`` completes it."""
     started = time.perf_counter()
     first = None
     events = 0
     raw_bytes = b""
     backend = None
     queue_ms = None
-    async with client.stream(
-        "POST", "/completion", json=body(prompt, stream=True, n_predict=n_predict)
-    ) as response:
-        backend = response.headers.get("x-gateway-backend")
-        header_queue = response.headers.get("x-gateway-queue-ms")
-        if header_queue is not None:
-            queue_ms = float(header_queue)
-        decoder = SSEEventDecoder()
-        async for chunk in response.aiter_raw():
-            raw_bytes += chunk
-            for event in decoder.feed(chunk):
-                events += 1
-                obj = event.json()
-                if first is None:
-                    content = None
+    status = 0
+    completed = False
+    error = None
+    try:
+        async with client.stream(
+            "POST", "/completion", json=body(prompt, stream=True, n_predict=n_predict),
+            headers={"X-Session-ID": session} if session else None,
+        ) as response:
+            status = response.status_code
+            backend = response.headers.get("x-gateway-backend")
+            header_queue = response.headers.get("x-gateway-queue-ms")
+            if header_queue is not None:
+                queue_ms = float(header_queue)
+            decoder = SSEEventDecoder()
+            async for chunk in response.aiter_raw():
+                raw_bytes += chunk
+                for event in decoder.feed(chunk):
+                    events += 1
+                    obj = event.json()
                     if isinstance(obj, dict):
-                        content = obj.get("content") or obj.get("pad")
-                    if content:
-                        first = time.perf_counter() - started
-        decoder.flush()
-        status = response.status_code
+                        if obj.get("stop") is True:
+                            completed = True
+                        if first is None and obj.get("content"):
+                            first = time.perf_counter() - started
+            # An unterminated trailing event is not proof of protocol completion.
+            if status != 200:
+                error = f"http_{status}"
+            elif not completed:
+                error = "incomplete_sse"
+    except httpx.TimeoutException as exc:
+        error = f"transport_timeout:{type(exc).__name__}"
+    except Exception as exc:  # noqa: BLE001 - persist a failed measurement
+        error = f"transport_error:{type(exc).__name__}"
     return StreamResult(
-        status=status,
-        backend=backend,
-        first_content_s=first,
-        total_s=time.perf_counter() - started,
-        events=events,
-        raw=raw_bytes,
-        queue_ms=queue_ms,
+        status=status, backend=backend, first_content_s=first,
+        total_s=time.perf_counter() - started, events=events,
+        raw=raw_bytes, queue_ms=queue_ms,
+        completed=status == 200 and completed and error is None, error=error,
     )
 
 
@@ -164,22 +179,24 @@ async def scenario_normal(config, gateway_port: int, log_dir: Path) -> dict:
                         "total_s": result.total_s,
                         "events": result.events,
                         "queue_ms": result.queue_ms,
+                        "completed": result.completed,
+                        "error": result.error,
                     }
                 )
             metrics = parse_prometheus(await fetch_text(client, f"{gateway_url}/metrics"))
-        durations = [1000.0 * record["total_s"] for record in records if record["status"] == 200]
+        durations = [1000.0 * record["total_s"] for record in records if record.get("completed") is True]
         firsts = [
             1000.0 * record["first_content_s"]
             for record in records
-            if record["first_content_s"] is not None
+            if record.get("completed") is True and record["first_content_s"] is not None
         ]
         return {
             "scenario": "normal",
             "requests": records,
             "summary": {
                 "offered": len(records),
-                "completed": sum(1 for record in records if record["status"] == 200),
-                "errors": sum(1 for record in records if record["status"] != 200),
+                "completed": sum(1 for record in records if record.get("completed") is True),
+                "errors": sum(1 for record in records if record.get("completed") is not True),
                 "duration_ms_p50": percentile(durations, 0.50),
                 "duration_ms_p95": percentile(durations, 0.95),
                 "first_content_ms_p50": percentile(firsts, 0.50),
@@ -445,7 +462,7 @@ def aggregate_reliability(results: list[dict]) -> dict:
 
     normal = [result for result in results if result["scenario"] == "normal"]
     records = [record for result in normal for record in result["requests"]]
-    completed = [record for record in records if record["status"] == 200]
+    completed = [record for record in records if record.get("completed") is True]
     durations = [1000.0 * record["total_s"] for record in completed]
     firsts = [
         1000.0 * record["first_content_s"]
@@ -484,9 +501,8 @@ def aggregate_reliability(results: list[dict]) -> dict:
         ),
         "backend_requests_processing_after": {
             backend: max(
-                result["summary"]["backend_requests_processing_after"].get(backend, 0)
-                or 0
-                for result in deadline
+                (result["summary"]["backend_requests_processing_after"].get(backend, 0)
+                 or 0 for result in deadline), default=0,
             )
             for backend in ("a", "b")
         },
@@ -587,6 +603,8 @@ async def async_main(outdir: Path, repeats: int = 1) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     gateway_port = free_port()
     meta = {
+        "assets": asset_metadata(),
+        "backend_args": BACKEND_ARGS,
         "created_at": now_iso(),
         "config": str(config_path),
         "gateway_port": gateway_port,

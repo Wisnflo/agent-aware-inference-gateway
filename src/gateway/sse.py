@@ -8,6 +8,7 @@ upstream order and nothing is parsed twice.
 The proxy forwards raw chunks unchanged; this decoder is used only for
 metrics such as event count, time-to-first-content and cache counters.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -27,39 +28,62 @@ class SSEEvent:
             return None
         try:
             return json.loads(self.data)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
             return None
 
 
 class SSEEventDecoder:
-    def __init__(self) -> None:
-        self._buffer = b""
+    def __init__(self, max_event_bytes: int = 64 * 1024) -> None:
+        if max_event_bytes < 1:
+            raise ValueError("max_event_bytes must be positive")
+        self._max_event_bytes = max_event_bytes
+        self._buffer = bytearray()
+        self._scan_from = 0
+        self._discarding = False
 
     def feed(self, chunk: bytes) -> list[SSEEvent]:
-        self._buffer += chunk
         events: list[SSEEvent] = []
-        while True:
-            boundary = _find_boundary(self._buffer)
-            if boundary is None:
-                break
-            index, length = boundary
-            raw, self._buffer = self._buffer[:index], self._buffer[index + length :]
-            event = _parse_event(raw)
-            if event is not None:
-                events.append(event)
+        # This parser observes metrics only. Oversized events are skipped while
+        # the proxy continues forwarding the original bytes unchanged.
+        for offset in range(0, len(chunk), self._max_event_bytes):
+            self._buffer.extend(chunk[offset : offset + self._max_event_bytes])
+            while True:
+                boundary = _find_boundary(self._buffer, self._scan_from)
+                if boundary is None:
+                    if len(self._buffer) > self._max_event_bytes + 3:
+                        self._discarding = True
+                        del self._buffer[:-3]
+                    self._scan_from = max(0, len(self._buffer) - 3)
+                    break
+                index, length = boundary
+                if not self._discarding and index <= self._max_event_bytes:
+                    event = _parse_event(self._buffer[:index])
+                    if event is not None:
+                        events.append(event)
+                del self._buffer[: index + length]
+                self._scan_from = 0
+                self._discarding = False
         return events
 
     def flush(self) -> list[SSEEvent]:
         """Emit a trailing event that was not terminated by a blank line."""
-        raw, self._buffer = self._buffer, b""
-        event = _parse_event(raw) if raw.strip() else None
+        raw, self._buffer = self._buffer, bytearray()
+        event = (
+            _parse_event(raw)
+            if not self._discarding
+            and len(raw) <= self._max_event_bytes
+            and raw.strip()
+            else None
+        )
+        self._scan_from = 0
+        self._discarding = False
         return [event] if event is not None else []
 
 
-def _find_boundary(buffer: bytes) -> tuple[int, int] | None:
+def _find_boundary(buffer: bytes | bytearray, start: int = 0) -> tuple[int, int] | None:
     candidates: list[tuple[int, int]] = []
     for marker, length in ((b"\r\n\r\n", 4), (b"\n\n", 2), (b"\r\r", 2)):
-        index = buffer.find(marker)
+        index = buffer.find(marker, start)
         if index != -1:
             candidates.append((index, length))
     if not candidates:

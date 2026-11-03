@@ -1,87 +1,36 @@
-# Limitations
+# 使用范围与限制
 
-This document is deliberately conservative. A limitation listed here is not a
-bug report; it is a boundary the project has not proven or does not intend to
-cover.
+适用范围是受信任的本机实验：一个 Python 网关进程，静态配置的 llama.cpp 后端，以及由使用者控制的请求和模型。默认监听 `127.0.0.1`。开放到不可信网络需要单独设计访问控制和资源保护。
 
-## Routing and caching
+## 路由与后端
 
-- **No prefix-aware or KV-aware routing.** The routing key is `X-Session-ID`,
-  never prompt text or KV-cache location. Prefix-aware routing exists in vLLM
-  Router and was measured in Phase 2.1 to add nothing over session affinity for
-  unique session prefixes.
-- **Session affinity can concentrate load.** The 15-session regression maps
-  9/6 to two backends, not 7.5/7.5. Per-backend admission caps can trade
-  utilisation for isolation.
-- **Immediate failback.** After a preferred backend recovers, the next request
-  for that session immediately returns to it. This is deterministic and tested,
-  but can lose prefix cache again and can create a recovery-time burst.
-- **Queued requests are not proactively migrated on health removal.** A request
-  queued for backend A before A is removed may still be admitted and attempted
-  against A; a connection failure is then handled by the safe retry path. It
-  does not bypass capacity, but it can add latency.
+- 路由仅使用 `X-Session-ID`，不感知 prompt 前缀或 KV-cache 位置，也不实现负载感知分配。会话亲和可能造成后端负载不均。
+- 后端恢复后立即 failback，可能再次丢失缓存并形成集中请求。等待队列中的请求不会因健康摘除主动迁移。
+- 没有完整熔断器、Kubernetes 服务发现或动态后端配置。
+- 后端应使用相同模型与兼容协议。OpenAI 兼容端点是转发接口，不承诺覆盖整个 OpenAI API。
 
-## Cancellation and streaming
+## 取消、期限与资源
 
-- **Internal inference cancellation is not proven.** Fake/raw backends prove
-  gateway task cancellation and upstream connection closure. Real llama.cpp
-  runs show `llamacpp:requests_processing` returning to zero, but this does not
-  prove that every internal KV/slot operation stopped.
-- **SSE status is already committed after headers.** If an execution deadline
-  or upstream error occurs after `200` headers were sent, the gateway can only
-  terminate the stream; it cannot change the HTTP status. It never appends a
-  synthetic `[DONE]`.
-- **Request bodies are fully read before forwarding.** Only responses are
-  streamed. Very large request bodies can consume gateway memory.
-- **No per-request body-size limit.** The gateway relies on the ASGI server and
-  deployment for that boundary.
+- 请求体完整读入内存，没有请求体大小上限；非流式响应也完整读入内存。容量限制控制执行请求数，不限制所有未准入连接的内存。
+- 正常 JSON 和 SSE 的下游发送受请求与执行期限约束。响应开始前已超时时，504 错误发送最多给 50 ms 宽限；事件循环调度、操作系统发送缓冲和响应清理也可能产生退出延迟。头部发出后只能终止传输，不能把 200 改成 504。
+- 网关的结束状态与连接清理可由假后端测试确定；尚未证明真实推理引擎所有内部 KV 或 slot 操作均被取消。
+- 健康探测和推理共用 HTTPX 连接池。探测使用 HTTPX 阶段超时，未独立隔离连接池或实现总探测期限。
 
-## Reliability
+## 指标与成功定义
 
-- **Retry is intentionally narrow.** Only `ConnectError` / `ConnectTimeout`
-  before request dispatch is retried. Read timeouts, protocol errors, upstream
-  5xx and mid-stream failures are treated as unknown or non-retryable and are
-  not retried automatically.
-- **No circuit breaker.** Health is a per-backend debounced probe/passive
-  failure state, not a full circuit breaker with half-open probes.
-- **No Kubernetes/service discovery.** Backends are static configuration.
-- **Health probes share the upstream HTTP client pool.** Under extreme
-  connection-pool pressure a probe can be delayed; the current admission limits
-  make this unlikely but it is not isolated by design.
-- **No execution-level retry after headers.** A non-stream body read failure
-  after headers returns 502; it is not retried because the request may already
-  have executed.
+- 容量和 Prometheus 指标均为单进程数据，多 worker 没有共享容量或指标聚合。
+- `gateway_requests_total` 表示 HTTP 结果；已发出 200 的 SSE 随后出错，HTTP 状态仍为 200，须同时查看流式终止原因和客户端完整事件。
+- 流式 `completed` 指标表示网关正常读到上游 EOF，不等同于协议完成；Benchmark 额外要求完整的原生 `stop: true` 事件，详见[指标说明](metrics.md)。
+- 不使用 session ID、提示词或客户端地址作为指标标签。短会话指纹仍可关联重复会话，不应把它当作匿名化数据。
 
-## Metrics
+## 安全与运维
 
-- **Per-process metrics.** No multi-worker aggregation. Running uvicorn with
-  multiple workers would require a Prometheus multiprocess setup.
-- **Attempt-level vs request-level counters.** `gateway_retries_total`,
-  `gateway_upstream_errors_total` and `gateway_admission_admitted_total` are
-  attempt-level. `gateway_requests_total` is the final request result.
-- **Stream deadline status.** A stream that times out after headers is counted
-  in `gateway_requests_total{status="200"}` plus
-  `gateway_stream_terminations_total{reason="deadline"}`; the status label is
-  the HTTP status actually sent, not a synthetic failure code.
-- **No per-session labels.** Session-level analysis must use benchmark raw
-  records; sessions are not metric labels.
+没有鉴权、TLS 终止和多租户隔离，也不提供计费或用户配额。日志不记录提示正文，基准输出仍需在公开前检查环境信息和路径。脚本只应管理自身启动的服务；端口被占用时不要终止未知进程。
 
-## Performance evidence
+上游应按本地推理服务使用，不把此项目当作通用 Web 反向代理。共享 HTTPX 客户端拒绝保存上游 Set-Cookie，显式下游 Cookie 仍按请求透传；这不构成用户会话隔离方案。第三方软件和模型按各自许可证使用，见[第三方说明](third-party.md)。
 
-- **CPU 0.5B model.** All latency/throughput numbers are from a single Apple
-  Silicon machine running Qwen2.5-0.5B-Instruct q4_0 on CPU. They must not be
-  generalized to GPU serving or larger models.
-- **Single-run real fault scenarios.** Deterministic fake/raw tests carry the
-  precision claims; real fault experiments are repeated in Week 4 but still
-  have a small sample and machine-specific health timing.
-- **Completed-only latency.** Overload benchmark p50/p95 exclude rejected and
-  timed-out requests by design; they are not overall user-perceived latency.
-- **No claim of p95 improvement from admission.** Bounded admission shapes
-  latency and exposes overload; it did not demonstrate throughput gains.
+## 性能证据
 
-## Security and operations
+历史 Week 1–4 数字未按修正后的 SSE 完成条件及显式 CPU 参数重跑，不作为当前版本性能结论。单次演示和真实 E2E 仅说明该配置下的功能行为。
 
-- No authentication, multi-tenancy, TLS termination, quota or billing.
-- No UI; operations are CLI and Prometheus.
-- Logs contain a session fingerprint, not raw session ids or prompt text.
-  Request bodies are never logged by the gateway.
+正式比较应保留硬件、模型、设备日志和所有结果分母。完成请求的 p50/p95 排除了拒绝、超时和失败，不能单独用于声称总体用户体验改善；0.5B CPU 结果不能外推到 GPU 集群或更大模型。

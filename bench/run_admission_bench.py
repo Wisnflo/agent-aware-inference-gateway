@@ -31,6 +31,8 @@ from prometheus_client.parser import text_string_to_metric_families
 
 from bench.run_bench import (
     PROJECT_ROOT,
+    BACKEND_ARGS,
+    asset_metadata,
     ProcessHandle,
     fetch_text,
     free_port,
@@ -138,6 +140,7 @@ async def run_one(
             "error_type": None,
             "error": None,
             "success": False,
+            "stream_completed": False,
         }
         try:
             async with client.stream(
@@ -163,6 +166,8 @@ async def run_one(
                     async for chunk in response.aiter_raw():
                         for event in decoder.feed(chunk):
                             obj = event.json()
+                            if isinstance(obj, dict) and obj.get("stop") is True:
+                                record["stream_completed"] = True
                             if (
                                 record["first_content_s"] is None
                                 and first_content(obj) is not None
@@ -182,9 +187,9 @@ async def run_one(
                             timings = obj["timings"]
                             record["cache_n"] = timings.get("cache_n")
                             record["prompt_n"] = timings.get("prompt_n")
-                    record["success"] = record["cache_n"] is not None
+                    record["success"] = record["stream_completed"] and record["cache_n"] is not None
                     if not record["success"]:
-                        record["error"] = "no timings in stream"
+                        record["error"] = "incomplete SSE or no timings in completed stream"
                 else:
                     raw = await response.aread()
                     try:
@@ -384,6 +389,8 @@ async def async_main(outdir: Path, repeats: int = 1) -> None:
     config = load_config(config_path)
     outdir.mkdir(parents=True, exist_ok=True)
     meta = {
+        "assets": asset_metadata(),
+        "backend_args": BACKEND_ARGS,
         "created_at": now_iso(),
         "workload": f"{N_REQUESTS} distinct long-prefix sessions, one turn each",
         "routing": "session_affinity",

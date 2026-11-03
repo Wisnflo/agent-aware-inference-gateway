@@ -16,6 +16,7 @@ Deadlines are monotonic absolute timestamps.  The total request deadline is
 fixed at arrival and is never reset by queueing, retries or failover.  The
 execution deadline is fixed at first admission and is also never reset.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -83,11 +84,11 @@ def _error(
 
 
 class _AttemptTimeout(Exception):
-    """The execution/total deadline expired while waiting for upstream headers."""
+    """The execution/total deadline expired while waiting for upstream data."""
 
 
 class _ClientGone(Exception):
-    """The client disconnected while the gateway awaited upstream headers."""
+    """The client disconnected while the gateway awaited upstream data."""
 
 
 @dataclass
@@ -147,31 +148,13 @@ class _FinalizingStreamingResponse(StreamingResponse):
                 # is still possible.  The finalizer releases capacity and closes
                 # the upstream response.
                 self._state.response_status = 504
-                body = json.dumps(
-                    {
-                        "error": {
-                            "type": self._timeout_kind,
-                            "message": "execution deadline expired before streaming",
-                        }
-                    }
-                ).encode()
-                await send(
-                    {
-                        "type": "http.response.start",
-                        "status": 504,
-                        "headers": [
-                            (b"content-type", b"application/json"),
-                            (b"content-length", str(len(body)).encode()),
-                        ],
-                    }
-                )
-                await send(
-                    {
-                        "type": "http.response.body",
-                        "body": body,
-                        "more_body": False,
-                    }
-                )
+                with suppress(TimeoutError):
+                    async with asyncio.timeout(0.05):
+                        await _error(
+                            504,
+                            self._timeout_kind,
+                            "execution deadline expired before streaming",
+                        )(scope, receive, send)
                 return
             try:
                 async with asyncio.timeout(remaining):
@@ -187,6 +170,75 @@ class _FinalizingStreamingResponse(StreamingResponse):
                     raise
         finally:
             await self._finalize()
+
+
+class _DeadlineResponse(Response):
+    """Keep the absolute budget and completion metrics around JSON send."""
+
+    def __init__(
+        self, *args, deadline_at: float, timeout_kind: str, on_finish, **kwargs
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._deadline_at = deadline_at
+        self._timeout_kind = timeout_kind
+        self._on_finish = on_finish
+
+    async def __call__(self, scope, receive, send) -> None:
+        status = self.status_code
+        reason = "completed"
+        committed = False
+
+        async def tracked_send(message) -> None:
+            nonlocal committed
+            if message["type"] == "http.response.start":
+                # Once passed to the server, do not attempt replacement headers.
+                committed = True
+            await send(message)
+
+        try:
+            remaining = self._deadline_at - time.perf_counter()
+            if remaining <= 0:
+                status, reason = 504, "deadline"
+                # The application can hand off an already-expired response.
+                # Report a real 504 if writable, with bounded error-send grace.
+                async with asyncio.timeout(0.05):
+                    await _error(
+                        504, self._timeout_kind, "deadline expired before sending"
+                    )(scope, receive, send)
+            else:
+                async with asyncio.timeout(remaining):
+                    await super().__call__(scope, receive, tracked_send)
+        except TimeoutError:
+            # Once headers are committed, no replacement body/status is safe.
+            reason = "deadline"
+            if not committed:
+                status = 504
+        except (asyncio.CancelledError, OSError):
+            reason = "client_disconnect"
+            if not committed:
+                status = 499
+            raise
+        except Exception:
+            reason = "error"
+            if not committed:
+                status = 500
+            raise
+        finally:
+            self._on_finish(status, reason)
+
+
+async def _complete_cleanup(coro) -> None:
+    """Finish owned cleanup even if its waiter is cancelled again."""
+    task = asyncio.create_task(coro)
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    task.result()
+    if cancelled:
+        raise asyncio.CancelledError
 
 
 class Proxy:
@@ -206,9 +258,7 @@ class Proxy:
 
     async def handle(self, request: Request, route: str) -> Response:
         started = time.perf_counter()
-        request_deadline = (
-            started + self.config.deadline.request_timeout_ms / 1000.0
-        )
+        request_deadline = started + self.config.deadline.request_timeout_ms / 1000.0
         session_id = request.headers.get("x-session-id")
 
         try:
@@ -257,9 +307,7 @@ class Proxy:
         )
 
         try:
-            ticket = await self._acquire(
-                request, route, backend, request_deadline
-            )
+            ticket = await self._acquire(request, route, backend, request_deadline)
         except AdmissionRejected:
             self.metrics.admission_rejected.labels(backend.id).inc()
             self.sync_capacity_metrics()
@@ -277,9 +325,7 @@ class Proxy:
                 "admission queue wait timed out",
             )
         except AdmissionDeadlineExceeded:
-            self.metrics.execution_timeouts.labels(
-                backend.id, "request_deadline"
-            ).inc()
+            self.metrics.execution_timeouts.labels(backend.id, "request_deadline").inc()
             self.sync_capacity_metrics()
             self._finish(route, backend, 504, started, None)
             return _error(
@@ -303,7 +349,9 @@ class Proxy:
             self.sync_capacity_metrics()
             raise
 
-        admitted_at = time.perf_counter()
+        admitted_at = (
+            ticket.admitted_at if ticket.admitted_at is not None else time.perf_counter()
+        )
         execution_deadline = min(
             request_deadline,
             admitted_at + self.config.deadline.execution_timeout_ms / 1000.0,
@@ -351,212 +399,228 @@ class Proxy:
         decision: RoutingDecision,
         ticket: AdmissionTicket,
     ) -> Response:
+        upstream = None
+        handed_off = False
         backend = decision.backend
-        attempt = 0
-        max_attempts = 1 + self.config.retry.max_retries
-        retry_from: str | None = None
+        try:
+            attempt = 0
+            max_attempts = 1 + self.config.retry.max_retries
+            retry_from: str | None = None
 
-        while True:
-            remaining = execution_deadline - time.perf_counter()
-            if remaining <= 0:
-                return self._timeout_with_ticket(
-                    route,
-                    backend,
-                    ticket,
-                    started,
-                    self._deadline_kind(request_deadline, execution_deadline),
-                    "execution deadline expired before dispatch",
-                )
+            while True:
+                remaining = execution_deadline - time.perf_counter()
+                if remaining <= 0:
+                    return self._timeout_with_ticket(
+                        route,
+                        backend,
+                        ticket,
+                        started,
+                        self._deadline_kind(request_deadline, execution_deadline),
+                        "execution deadline expired before dispatch",
+                    )
 
-            try:
-                upstream_request = backend.client.build_request(
-                    "POST",
-                    self._upstream_path(request),
-                    content=body,
-                    headers=headers,
-                )
-            except Exception:
-                self._release(ticket, route, backend, AdmissionState.FAILED)
-                raise
+                try:
+                    upstream_request = backend.client.build_request(
+                        "POST",
+                        self._upstream_path(request, route),
+                        content=body,
+                        headers=headers,
+                    )
+                except Exception:
+                    self._release(ticket, route, backend, AdmissionState.FAILED)
+                    raise
 
-            try:
-                upstream, upstream_started = await self._send_with_disconnect(
-                    request, backend, upstream_request, remaining
-                )
-                break
-            except _ClientGone:
-                self.metrics.client_cancelled.labels(route, "connecting").inc()
-                self._release(ticket, route, backend, AdmissionState.CANCELLED)
-                self._finish(route, backend, 499, started, None)
-                logger.info(
-                    "proxy client disconnected before headers route=%s backend=%s",
-                    route,
-                    backend.id,
-                )
-                return Response(status_code=499)
-            except _AttemptTimeout:
-                kind = self._deadline_kind(request_deadline, execution_deadline)
-                return self._timeout_with_ticket(
-                    route,
-                    backend,
-                    ticket,
-                    started,
-                    kind,
-                    "execution deadline expired before upstream headers",
-                )
-            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
-                self.pool.mark_failure(backend.id, type(exc).__name__)
-                self.metrics.upstream_errors.labels(backend.id, "connect").inc()
-                self.metrics.upstream_disconnects.labels(backend.id, "connect").inc()
-                self._release(ticket, route, backend, AdmissionState.FAILED)
-                if retry_from is not None:
-                    self.metrics.retry_results.labels(
-                        retry_from, backend.id, "failed"
+                try:
+                    upstream, upstream_started = await self._send_with_disconnect(
+                        request, backend, upstream_request, remaining
+                    )
+                    break
+                except _ClientGone:
+                    self.metrics.client_cancelled.labels(route, "connecting").inc()
+                    self._release(ticket, route, backend, AdmissionState.CANCELLED)
+                    self._finish(route, backend, 499, started, None)
+                    logger.info(
+                        "proxy client disconnected before headers route=%s backend=%s",
+                        route,
+                        backend.id,
+                    )
+                    return Response(status_code=499)
+                except _AttemptTimeout:
+                    kind = self._deadline_kind(request_deadline, execution_deadline)
+                    return self._timeout_with_ticket(
+                        route,
+                        backend,
+                        ticket,
+                        started,
+                        kind,
+                        "execution deadline expired before upstream headers",
+                    )
+                except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                    self.pool.mark_failure(backend.id, type(exc).__name__)
+                    self.metrics.upstream_errors.labels(backend.id, "connect").inc()
+                    self.metrics.upstream_disconnects.labels(
+                        backend.id, "connect"
                     ).inc()
-                logger.warning(
-                    "proxy connect failure route=%s backend=%s error=%s attempt=%d",
-                    route,
-                    backend.id,
-                    type(exc).__name__,
-                    attempt + 1,
-                )
-                if attempt + 1 >= max_attempts or time.perf_counter() >= execution_deadline:
+                    self._release(ticket, route, backend, AdmissionState.FAILED)
+                    if retry_from is not None:
+                        self.metrics.retry_results.labels(
+                            retry_from, backend.id, "failed"
+                        ).inc()
+                    logger.warning(
+                        "proxy connect failure route=%s backend=%s error=%s attempt=%d",
+                        route,
+                        backend.id,
+                        type(exc).__name__,
+                        attempt + 1,
+                    )
+                    if (
+                        attempt + 1 >= max_attempts
+                        or time.perf_counter() >= execution_deadline
+                    ):
+                        self._finish(route, backend, 502, started, None)
+                        return _error(
+                            502,
+                            "upstream_connect_error",
+                            f"backend {backend.id}: {type(exc).__name__}",
+                        )
+
+                    attempt += 1
+                    self.metrics.retries.labels(backend.id, "connect").inc()
+                    failed_backend = backend
+                    healthy = self.pool.healthy_ids() - {failed_backend.id}
+                    try:
+                        next_decision = self.router.decide(session_id, healthy)
+                    except NoHealthyBackend:
+                        self.metrics.retry_results.labels(
+                            failed_backend.id, "none", "no_backend"
+                        ).inc()
+                        self._finish(route, failed_backend, 502, started, None)
+                        return _error(
+                            502,
+                            "upstream_connect_error",
+                            "no healthy backend remains after connect failure",
+                        )
+
+                    next_backend = next_decision.backend
+                    try:
+                        next_ticket = await self._acquire(
+                            request, route, next_backend, execution_deadline
+                        )
+                    except AdmissionRejected:
+                        self.metrics.retry_results.labels(
+                            failed_backend.id, next_backend.id, "rejected"
+                        ).inc()
+                        self.metrics.admission_rejected.labels(next_backend.id).inc()
+                        self.sync_capacity_metrics()
+                        return self._reject(
+                            route,
+                            next_backend,
+                            started,
+                            "queue_full",
+                            "admission queue is full on retry target",
+                        )
+                    except AdmissionTimedOut:
+                        self.metrics.retry_results.labels(
+                            failed_backend.id, next_backend.id, "timed_out"
+                        ).inc()
+                        self.metrics.admission_timed_out.labels(next_backend.id).inc()
+                        self.sync_capacity_metrics()
+                        return self._reject(
+                            route,
+                            next_backend,
+                            started,
+                            "queue_timeout",
+                            "admission queue wait timed out on retry target",
+                        )
+                    except AdmissionDeadlineExceeded:
+                        kind = self._deadline_kind(request_deadline, execution_deadline)
+                        self.metrics.retry_results.labels(
+                            failed_backend.id, next_backend.id, "deadline"
+                        ).inc()
+                        self.metrics.execution_timeouts.labels(
+                            next_backend.id, kind
+                        ).inc()
+                        self._finish(route, next_backend, 504, started, None)
+                        return _error(
+                            504,
+                            kind,
+                            "deadline expired while waiting for retry capacity",
+                        )
+                    except ClientDisconnected:
+                        self.metrics.retry_results.labels(
+                            failed_backend.id, next_backend.id, "cancelled"
+                        ).inc()
+                        self.metrics.client_cancelled.labels(route, "queued").inc()
+                        self.metrics.admission_cancelled.labels(next_backend.id).inc()
+                        self.sync_capacity_metrics()
+                        self._finish(route, next_backend, 499, started, None)
+                        return Response(status_code=499)
+
+                    logger.info(
+                        "proxy retry route=%s from=%s to=%s attempt=%d",
+                        route,
+                        failed_backend.id,
+                        next_backend.id,
+                        attempt,
+                    )
+                    retry_from = failed_backend.id
+                    backend = next_backend
+                    ticket = next_ticket
+                    decision = next_decision
+                    continue
+                except httpx.HTTPError as exc:
+                    # The request may have been received; do not retry.
+                    self.pool.mark_failure(backend.id, type(exc).__name__)
+                    self.metrics.upstream_errors.labels(backend.id, "stream").inc()
+                    self.metrics.upstream_disconnects.labels(
+                        backend.id, "connect"
+                    ).inc()
+                    self._release(ticket, route, backend, AdmissionState.FAILED)
                     self._finish(route, backend, 502, started, None)
+                    logger.warning(
+                        "proxy upstream protocol failure route=%s backend=%s error=%s",
+                        route,
+                        backend.id,
+                        type(exc).__name__,
+                    )
                     return _error(
                         502,
-                        "upstream_connect_error",
+                        "upstream_error",
                         f"backend {backend.id}: {type(exc).__name__}",
                     )
+                except asyncio.CancelledError:
+                    self._release(ticket, route, backend, AdmissionState.CANCELLED)
+                    raise
 
-                attempt += 1
-                self.metrics.retries.labels(backend.id, "connect").inc()
-                failed_backend = backend
-                healthy = self.pool.healthy_ids() - {failed_backend.id}
-                try:
-                    next_decision = self.router.decide(session_id, healthy)
-                except NoHealthyBackend:
-                    self.metrics.retry_results.labels(
-                        failed_backend.id, "none", "no_backend"
-                    ).inc()
-                    self._finish(route, failed_backend, 502, started, None)
-                    return _error(
-                        502,
-                        "upstream_connect_error",
-                        "no healthy backend remains after connect failure",
-                    )
-
-                next_backend = next_decision.backend
-                try:
-                    next_ticket = await self._acquire(
-                        request, route, next_backend, request_deadline
-                    )
-                except AdmissionRejected:
-                    self.metrics.retry_results.labels(
-                        failed_backend.id, next_backend.id, "rejected"
-                    ).inc()
-                    self.metrics.admission_rejected.labels(next_backend.id).inc()
-                    self.sync_capacity_metrics()
-                    return self._reject(
-                        route,
-                        next_backend,
-                        started,
-                        "queue_full",
-                        "admission queue is full on retry target",
-                    )
-                except AdmissionTimedOut:
-                    self.metrics.retry_results.labels(
-                        failed_backend.id, next_backend.id, "timed_out"
-                    ).inc()
-                    self.metrics.admission_timed_out.labels(next_backend.id).inc()
-                    self.sync_capacity_metrics()
-                    return self._reject(
-                        route,
-                        next_backend,
-                        started,
-                        "queue_timeout",
-                        "admission queue wait timed out on retry target",
-                    )
-                except AdmissionDeadlineExceeded:
-                    self.metrics.retry_results.labels(
-                        failed_backend.id, next_backend.id, "deadline"
-                    ).inc()
-                    self.metrics.execution_timeouts.labels(
-                        next_backend.id, "request_deadline"
-                    ).inc()
-                    self._finish(route, next_backend, 504, started, None)
-                    return _error(
-                        504,
-                        "request_deadline",
-                        "request deadline expired before retry execution",
-                    )
-                except ClientDisconnected:
-                    self.metrics.retry_results.labels(
-                        failed_backend.id, next_backend.id, "cancelled"
-                    ).inc()
-                    self.metrics.client_cancelled.labels(route, "queued").inc()
-                    self.metrics.admission_cancelled.labels(next_backend.id).inc()
-                    self.sync_capacity_metrics()
-                    self._finish(route, next_backend, 499, started, None)
-                    return Response(status_code=499)
-
-                logger.info(
-                    "proxy retry route=%s from=%s to=%s attempt=%d",
-                    route,
-                    failed_backend.id,
-                    next_backend.id,
-                    attempt,
-                )
-                retry_from = failed_backend.id
-                backend = next_backend
-                ticket = next_ticket
-                decision = next_decision
-                continue
-            except httpx.HTTPError as exc:
-                # The request may have been received; do not retry.
-                self.pool.mark_failure(backend.id, type(exc).__name__)
-                self.metrics.upstream_errors.labels(backend.id, "stream").inc()
-                self.metrics.upstream_disconnects.labels(backend.id, "connect").inc()
-                self._release(ticket, route, backend, AdmissionState.FAILED)
-                self._finish(route, backend, 502, started, None)
-                logger.warning(
-                    "proxy upstream protocol failure route=%s backend=%s error=%s",
-                    route,
+            if retry_from is not None:
+                self.metrics.retry_results.labels(
+                    retry_from,
                     backend.id,
-                    type(exc).__name__,
-                )
-                return _error(
-                    502,
-                    "upstream_error",
-                    f"backend {backend.id}: {type(exc).__name__}",
-                )
-            except asyncio.CancelledError:
-                self._release(ticket, route, backend, AdmissionState.CANCELLED)
-                raise
+                    "success" if upstream.status_code < 500 else "http_error",
+                ).inc()
+                retry_from = None
 
-        if retry_from is not None:
-            self.metrics.retry_results.labels(
-                retry_from,
-                backend.id,
-                "success" if upstream.status_code < 500 else "http_error",
-            ).inc()
-            retry_from = None
+            content_type = upstream.headers.get("content-type", "")
+            if upstream.status_code >= 500:
+                # A business 5xx is request-specific; it is not a health failure.
+                self.metrics.upstream_errors.labels(backend.id, "http_status").inc()
 
-        content_type = upstream.headers.get("content-type", "")
-        if upstream.status_code >= 500:
-            # A business 5xx is request-specific; it is not a health failure.
-            self.metrics.upstream_errors.labels(backend.id, "http_status").inc()
+            if "text/event-stream" in content_type.lower():
+                state = _StreamState()
+                timeout_kind = self._deadline_kind(request_deadline, execution_deadline)
 
-        if "text/event-stream" in content_type.lower():
-            state = _StreamState()
-            timeout_kind = self._deadline_kind(request_deadline, execution_deadline)
+                async def finalize() -> None:
+                    await self._finalize_stream(
+                        state,
+                        upstream,
+                        ticket,
+                        backend,
+                        route,
+                        started,
+                        upstream_started,
+                    )
 
-            async def finalize() -> None:
-                await self._finalize_stream(
-                    state, upstream, ticket, backend, route, started, upstream_started
-                )
-
-            try:
-                return _FinalizingStreamingResponse(
+                response = _FinalizingStreamingResponse(
                     self._stream(upstream, backend, route, started, state),
                     finalize,
                     deadline_at=execution_deadline,
@@ -565,60 +629,77 @@ class Proxy:
                     status_code=upstream.status_code,
                     headers=self._response_headers(upstream, backend, ticket),
                 )
-            except Exception:
-                self._release(ticket, route, backend, AdmissionState.FAILED)
-                await self._aclose(upstream)
+                handed_off = True
+                return response
+
+            exit_state = AdmissionState.FAILED
+            try:
+                raw = await self._read_with_disconnect(
+                    request, upstream, execution_deadline - time.perf_counter()
+                )
+                self._observe_json_usage(backend, raw, content_type)
+                self.metrics.upstream_duration.labels(route, backend.id).observe(
+                    time.perf_counter() - upstream_started
+                )
+                response_headers = self._response_headers(upstream, backend, ticket)
+                exit_state = AdmissionState.FINISHED
+            except _AttemptTimeout:
+                exit_state = AdmissionState.TIMED_OUT
+                return self._timeout_with_ticket(
+                    route,
+                    backend,
+                    ticket,
+                    started,
+                    self._deadline_kind(request_deadline, execution_deadline),
+                    "execution deadline expired while reading the body",
+                )
+            except httpx.HTTPError as exc:
+                self.pool.mark_failure(backend.id, type(exc).__name__)
+                self.metrics.upstream_errors.labels(backend.id, "stream").inc()
+                self.metrics.upstream_disconnects.labels(backend.id, "body").inc()
+                self._finish(route, backend, 502, started, None)
+                return _error(
+                    502, "upstream_error", f"backend {backend.id}: {type(exc).__name__}"
+                )
+            except _ClientGone:
+                exit_state = AdmissionState.CANCELLED
+                self.metrics.client_cancelled.labels(route, "body").inc()
+                self._finish(route, backend, 499, started, None)
+                return Response(status_code=499)
+            except asyncio.CancelledError:
+                exit_state = AdmissionState.CANCELLED
+                self.metrics.client_cancelled.labels(route, "body").inc()
                 raise
+            finally:
+                # Capacity never depends on the success of statistics or close I/O.
+                self._release(ticket, route, backend, exit_state)
 
-        remaining = execution_deadline - time.perf_counter()
-        if remaining <= 0:
-            await self._aclose(upstream)
-            return self._timeout_with_ticket(
-                route,
-                backend,
-                ticket,
-                started,
-                self._deadline_kind(request_deadline, execution_deadline),
-                "execution deadline expired before reading the body",
-            )
-        try:
-            async with asyncio.timeout(remaining):
-                raw = await upstream.aread()
-        except TimeoutError:
-            await self._aclose(upstream)
-            return self._timeout_with_ticket(
-                route,
-                backend,
-                ticket,
-                started,
-                self._deadline_kind(request_deadline, execution_deadline),
-                "execution deadline expired while reading the body",
-            )
-        except httpx.HTTPError as exc:
-            await self._aclose(upstream)
-            self.pool.mark_failure(backend.id, type(exc).__name__)
-            self.metrics.upstream_errors.labels(backend.id, "stream").inc()
-            self.metrics.upstream_disconnects.labels(backend.id, "body").inc()
-            self._release(ticket, route, backend, AdmissionState.FAILED)
-            self._finish(route, backend, 502, started, None)
-            return _error(
-                502, "upstream_error", f"backend {backend.id}: {type(exc).__name__}"
-            )
-        except asyncio.CancelledError:
-            await self._aclose(upstream)
-            self.metrics.client_cancelled.labels(route, "body").inc()
-            self._release(ticket, route, backend, AdmissionState.CANCELLED)
-            raise
+            timeout_kind = self._deadline_kind(request_deadline, execution_deadline)
 
-        await self._aclose(upstream)
-        self._observe_json_usage(backend, raw, content_type)
-        self._release(ticket, route, backend, AdmissionState.FINISHED)
-        self._finish(route, backend, upstream.status_code, started, upstream_started)
-        return Response(
-            content=raw,
-            status_code=upstream.status_code,
-            headers=self._response_headers(upstream, backend, ticket),
-        )
+            def finish_send(status: int, reason: str) -> None:
+                if reason == "deadline":
+                    self.metrics.execution_timeouts.labels(
+                        backend.id, timeout_kind
+                    ).inc()
+                elif reason == "client_disconnect":
+                    self.metrics.client_cancelled.labels(route, "sending").inc()
+                self._finish(route, backend, status, started, None)
+
+            return _DeadlineResponse(
+                content=raw,
+                status_code=upstream.status_code,
+                headers=response_headers,
+                deadline_at=execution_deadline,
+                timeout_kind=timeout_kind,
+                on_finish=finish_send,
+            )
+        finally:
+            if not handed_off:
+                try:
+                    self._release(ticket, route, backend, AdmissionState.FAILED)
+                finally:
+                    if upstream is not None:
+                        await self._aclose(upstream)
 
     async def _acquire(
         self,
@@ -636,11 +717,15 @@ class Proxy:
             ticket = await acquire_with_disconnect(
                 self.admission, request, backend.id, deadline_at=request_deadline
             )
-        self.metrics.admission_admitted.labels(backend.id).inc()
-        self.metrics.queue_wait.labels(backend.id).observe(
-            ticket.queue_wait_s or 0.0
-        )
-        self.sync_capacity_metrics()
+        try:
+            self.metrics.admission_admitted.labels(backend.id).inc()
+            self.metrics.queue_wait.labels(backend.id).observe(
+                ticket.queue_wait_s or 0.0
+            )
+            self.sync_capacity_metrics()
+        except BaseException:
+            self.admission.release(ticket, AdmissionState.FAILED)
+            raise
         return ticket
 
     async def _send_with_disconnect(
@@ -655,27 +740,55 @@ class Proxy:
             name=f"upstream-send-{backend.id}",
         )
         upstream_started = time.perf_counter()
+        transferred = False
         try:
             async with asyncio.timeout(remaining):
                 while True:
                     done, _ = await asyncio.wait({send_task}, timeout=0.05)
                     if done:
-                        return send_task.result(), upstream_started
+                        response = send_task.result()
+                        transferred = True
+                        return response, upstream_started
                     if await request.is_disconnected():
-                        send_task.cancel()
-                        with suppress(asyncio.CancelledError):
-                            await send_task
                         raise _ClientGone()
         except TimeoutError:
-            send_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await send_task
             raise _AttemptTimeout() from None
-        except asyncio.CancelledError:
-            send_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await send_task
-            raise
+        finally:
+            if not transferred:
+                await _complete_cleanup(self._discard_send(send_task))
+
+    async def _discard_send(self, task: asyncio.Task) -> None:
+        task.cancel()
+        try:
+            response = await task
+        except (asyncio.CancelledError, Exception):
+            return
+        # cancel() is a no-op once the task has returned headers. Its result
+        # still belongs to us until explicitly transferred to the caller.
+        await self._aclose(response)
+
+    async def _read_with_disconnect(
+        self, request: Request, upstream: httpx.Response, remaining: float
+    ) -> bytes:
+        task = asyncio.create_task(upstream.aread(), name="upstream-json-body")
+        try:
+            async with asyncio.timeout(max(0, remaining)):
+                while True:
+                    done, _ = await asyncio.wait({task}, timeout=0.05)
+                    if done:
+                        return task.result()
+                    if await request.is_disconnected():
+                        raise _ClientGone()
+        except TimeoutError:
+            raise _AttemptTimeout() from None
+        finally:
+            await _complete_cleanup(self._discard_read(task))
+
+    @staticmethod
+    async def _discard_read(task: asyncio.Task) -> None:
+        task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await task
 
     def _timeout_with_ticket(
         self,
@@ -690,11 +803,16 @@ class Proxy:
         self._release(ticket, route, backend, AdmissionState.TIMED_OUT)
         self._finish(route, backend, 504, started, None)
         logger.warning(
-            "proxy deadline exceeded route=%s backend=%s kind=%s", route, backend.id, kind
+            "proxy deadline exceeded route=%s backend=%s kind=%s",
+            route,
+            backend.id,
+            kind,
         )
         return _error(504, kind, message)
 
-    def _no_backend_timeout(self, route: str, started: float, kind: str) -> JSONResponse:
+    def _no_backend_timeout(
+        self, route: str, started: float, kind: str
+    ) -> JSONResponse:
         self.metrics.execution_timeouts.labels(NO_BACKEND.id, kind).inc()
         self.metrics.requests_total.labels(route, "504", NO_BACKEND.id).inc()
         self.metrics.request_duration.labels(route, NO_BACKEND.id).observe(
@@ -712,7 +830,10 @@ class Proxy:
     ) -> JSONResponse:
         self._finish(route, backend, 429, started, None)
         logger.info(
-            "proxy admission rejected route=%s backend=%s kind=%s", route, backend.id, kind
+            "proxy admission rejected route=%s backend=%s kind=%s",
+            route,
+            backend.id,
+            kind,
         )
         return _error(
             429,
@@ -815,31 +936,36 @@ class Proxy:
         if state.finalized:
             return
         state.finalized = True
+        exit_state = (
+            AdmissionState.TIMED_OUT
+            if state.timed_out
+            else AdmissionState.CANCELLED
+            if state.disconnected
+            else AdmissionState.FAILED
+            if state.failed
+            else AdmissionState.FINISHED
+        )
+        try:
+            self._release(ticket, route, backend, exit_state)
+        finally:
+            await self._aclose(upstream)
         if state.events:
             self.metrics.sse_events.labels(backend.id).inc(state.events)
-        await self._aclose(upstream)
         if state.timed_out:
-            exit_state = AdmissionState.TIMED_OUT
             self.metrics.execution_timeouts.labels(
                 backend.id, state.deadline_kind
             ).inc()
             self.metrics.stream_terminations.labels(backend.id, "deadline").inc()
         elif state.disconnected:
-            exit_state = AdmissionState.CANCELLED
             self.metrics.client_disconnects.labels(route).inc()
             self.metrics.client_cancelled.labels(route, "streaming").inc()
             self.metrics.stream_terminations.labels(
                 backend.id, "client_disconnect"
             ).inc()
         elif state.failed:
-            exit_state = AdmissionState.FAILED
-            self.metrics.stream_terminations.labels(
-                backend.id, "upstream_error"
-            ).inc()
+            self.metrics.stream_terminations.labels(backend.id, "upstream_error").inc()
         else:
-            exit_state = AdmissionState.FINISHED
             self.metrics.stream_terminations.labels(backend.id, "completed").inc()
-        self._release(ticket, route, backend, exit_state)
         self._finish(
             route,
             backend,
@@ -875,12 +1001,14 @@ class Proxy:
         self._observe_timings(backend, obj)
         return first_content_seen
 
-    def _observe_json_usage(self, backend: Backend, raw: bytes, content_type: str) -> None:
+    def _observe_json_usage(
+        self, backend: Backend, raw: bytes, content_type: str
+    ) -> None:
         if "json" not in content_type.lower():
             return
         try:
             obj = json.loads(raw)
-        except (json.JSONDecodeError, UnicodeDecodeError):
+        except (ValueError, RecursionError, UnicodeDecodeError):
             return
         self._observe_timings(backend, obj)
 
@@ -892,12 +1020,19 @@ class Proxy:
             return
         cached = timings.get("cache_n")
         fresh = timings.get("prompt_n")
-        if isinstance(cached, int) and isinstance(fresh, int):
-            self.metrics.observe_usage(backend.id, cached, fresh)
+        if type(cached) is int and type(fresh) is int and cached >= 0 and fresh >= 0:
+            try:
+                self.metrics.observe_usage(backend.id, cached, fresh)
+            except Exception:
+                # Upstream usage is optional telemetry, never response control.
+                logger.exception("cannot observe upstream usage backend=%s", backend.id)
 
     async def _aclose(self, upstream: httpx.Response) -> None:
-        with suppress(Exception):
-            await upstream.aclose()
+        async def close() -> None:
+            with suppress(Exception):
+                await upstream.aclose()
+
+        await _complete_cleanup(close())
 
     @staticmethod
     def _deadline_kind(request_deadline: float, execution_deadline: float) -> str:
@@ -932,10 +1067,14 @@ class Proxy:
         headers["accept-encoding"] = "identity"
         return headers
 
-    def _upstream_path(self, request: Request) -> str:
-        path = request.url.path
-        if request.url.query:
-            path = f"{path}?{request.url.query}"
+    def _upstream_path(self, request: Request, route: str) -> str:
+        path = {
+            "completion": "/completion",
+            "chat_completions": "/v1/chat/completions",
+        }[route]
+        query = request.scope.get("query_string", b"").decode("ascii")
+        if query:
+            path = f"{path}?{query}"
         return path
 
     def _response_headers(

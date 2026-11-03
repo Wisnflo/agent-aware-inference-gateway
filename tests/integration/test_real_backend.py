@@ -4,6 +4,7 @@ Skipped unless ``GATEWAY_REAL_BACKENDS=1``.  The default binary/model paths are
 the ones used by the Week 1 benchmark; override with ``LLAMA_SERVER``,
 ``GATEWAY_MODEL`` and ``GATEWAY_E2E_PORTS``.
 """
+
 from __future__ import annotations
 
 import json
@@ -30,16 +31,15 @@ pytestmark = [
     ),
 ]
 
-WORKSPACE = str(Path.home() / "PersonalHub" / "workspace")
+WORKSPACE = os.environ.get("GATEWAY_WORKSPACE", str(Path.home() / "gateway-assets"))
 LLAMA_SERVER = os.environ.get(
-    "LLAMA_SERVER", f"{WORKSPACE}/tools/llama.cpp/build/bin/llama-server"
+    "LLAMA_SERVER", f"{WORKSPACE}/llama.cpp/build/bin/llama-server"
 )
 MODEL = os.environ.get(
     "GATEWAY_MODEL", f"{WORKSPACE}/models/qwen2.5-0.5b-instruct-q4_0.gguf"
 )
 PORTS = tuple(
-    int(part)
-    for part in os.environ.get("GATEWAY_E2E_PORTS", "18190,18191").split(",")
+    int(part) for part in os.environ.get("GATEWAY_E2E_PORTS", "18190,18191").split(",")
 )
 
 LONG_PREFIX = (
@@ -50,48 +50,71 @@ LONG_PREFIX = (
 
 
 def start_backend(port: int, log_path: str) -> subprocess.Popen:
-    log = open(log_path, "w")
-    process = subprocess.Popen(
-        [
-            LLAMA_SERVER,
-            "-m",
-            MODEL,
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "-c",
-            "4096",
-            "-n",
-            "16",
-            "-t",
-            "4",
-            "--metrics",
-            "--no-webui",
-        ],
-        stdout=log,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        try:
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{port}/health", timeout=1
-            ) as response:
-                if response.status == 200:
-                    return process
-        except Exception:
-            time.sleep(0.25)
-    stop_backend(process)
-    raise RuntimeError(f"llama-server on port {port} did not become healthy")
+    command = [
+        LLAMA_SERVER,
+        "-m",
+        MODEL,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "-c",
+        "4096",
+        "-n",
+        "16",
+        "-t",
+        "4",
+        "--threads-batch",
+        "4",
+        "--parallel",
+        "1",
+        "--device",
+        "none",
+        "-ngl",
+        "0",
+        "--metrics",
+        "--no-webui",
+    ]
+    with open(log_path, "w") as log:
+        process = subprocess.Popen(
+            command,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    try:
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                tail = Path(log_path).read_text(errors="replace")[-2000:]
+                raise RuntimeError(
+                    f"llama-server exited with {process.returncode}: {tail}"
+                )
+            try:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/health", timeout=1
+                ) as response:
+                    if response.status == 200:
+                        return process
+            except Exception:
+                time.sleep(0.25)
+        raise RuntimeError(
+            f"llama-server on port {port} did not become healthy; see {log_path}"
+        )
+    except BaseException:
+        stop_backend(process)
+        raise
 
 
 def stop_backend(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
         return
+    except PermissionError:
+        process.terminate()
     try:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
@@ -99,6 +122,9 @@ def stop_backend(process: subprocess.Popen) -> None:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        except PermissionError:
+            process.kill()
+        process.wait(timeout=5)
 
 
 @pytest.fixture(scope="module")
@@ -146,7 +172,9 @@ def sse_events(raw: bytes) -> list[dict]:
     return events
 
 
-async def stream_completion(client, prompt: str, session: str) -> tuple[str, list[dict]]:
+async def stream_completion(
+    client, prompt: str, session: str
+) -> tuple[str, list[dict]]:
     raw = b""
     async with client.stream(
         "POST",
@@ -201,7 +229,10 @@ async def test_streaming_cache_reuse_same_session(gateway, real_backends):
         prompt_total = metric_sum(text, "gateway_prompt_tokens_total")
         assert cached > 0
         assert cached <= prompt_total
-        assert metric_sum(text, "gateway_requests_total", route="completion", status="200") == 2
+        assert (
+            metric_sum(text, "gateway_requests_total", route="completion", status="200")
+            == 2
+        )
         assert metric_sum(text, "gateway_sse_events_total") >= 4
 
 
