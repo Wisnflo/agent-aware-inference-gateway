@@ -5,4 +5,4 @@ retries, health failover, prefix/KV-cache-aware routing, runtime backend
 registration and HTTP/SSE cancellation handling for llama.cpp backends.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
