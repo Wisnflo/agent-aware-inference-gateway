@@ -14,6 +14,7 @@ from gateway.config import (
     DeadlineConfig,
     GatewayConfig,
     HealthConfig,
+    PrefixConfig,
     RetryConfig,
 )
 from gateway.server import create_app
@@ -29,8 +30,16 @@ async def gateway_env(
     deadline=None,
     retry=None,
     health=None,
+    prefix=None,
+    admin=None,
+    max_request_body_bytes=None,
     health_interval=3600.0,
 ):
+    kwargs = {}
+    if admin is not None:
+        kwargs["admin"] = admin
+    if max_request_body_bytes is not None:
+        kwargs["max_request_body_bytes"] = max_request_body_bytes
     config = GatewayConfig(
         backends=tuple(backends),
         strategy=strategy,
@@ -41,6 +50,8 @@ async def gateway_env(
         deadline=deadline or DeadlineConfig(),
         retry=retry or RetryConfig(),
         health=health or HealthConfig(),
+        prefix=prefix or PrefixConfig(),
+        **kwargs,
     )
     app = create_app(config)
     server = await start_server(app)

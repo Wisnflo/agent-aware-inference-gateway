@@ -19,7 +19,7 @@ import httpx
 import pytest
 from prometheus_client.parser import text_string_to_metric_families
 
-from gateway.config import BackendConfig, GatewayConfig
+from gateway.config import BackendConfig, GatewayConfig, PrefixConfig
 from gateway.server import create_app
 from tests.support import start_server
 
@@ -280,3 +280,47 @@ async def test_health_reports_both_real_backends(gateway, real_backends):
         assert payload["status"] == "ok"
         assert payload["backends"]["a"]["healthy"] is True
         assert payload["backends"]["b"]["healthy"] is True
+
+
+async def test_real_tokenizer_prefix_and_openai_routes(real_backends):
+    """llama.cpp /tokenize drives token-prefix routing, not just chars."""
+    tokenizer_url = f"http://127.0.0.1:{real_backends[0]}"
+    config = GatewayConfig(
+        backends=tuple(
+            BackendConfig(name, f"http://127.0.0.1:{port}")
+            for name, port in zip(("a", "b"), real_backends)
+        ),
+        strategy="prefix_affinity",
+        health_interval_s=3600.0,
+        prefix=PrefixConfig(
+            min_match_chars=1,
+            tokenizer_url=tokenizer_url,
+            min_match_tokens=4,
+        ),
+    )
+    server = await start_server(create_app(config))
+    try:
+        async with httpx.AsyncClient(base_url=server.url, timeout=180) as client:
+            prompt = LONG_PREFIX + " Tokenizer path."
+            payload = {"prompt": prompt, "n_predict": 1, "temperature": 0}
+            first = await client.post("/completion", json=payload)
+            second = await client.post("/completion", json=payload)
+            assert first.status_code == 200
+            assert second.status_code == 200
+            assert first.headers["x-gateway-backend"] == second.headers[
+                "x-gateway-backend"
+            ]
+            metrics = (await client.get("/metrics")).text
+            assert metric_sum(metrics, "gateway_prefix_match_tokens_count") >= 1
+
+            models = await client.get("/v1/models")
+            assert models.status_code == 200
+            assert models.json()["data"]
+
+            completions = await client.post(
+                "/v1/completions",
+                json={"prompt": "hello", "n_predict": 1, "temperature": 0},
+            )
+            assert completions.status_code == 200
+    finally:
+        await server.stop()

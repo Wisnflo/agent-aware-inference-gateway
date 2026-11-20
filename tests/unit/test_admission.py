@@ -5,6 +5,7 @@ import pytest
 from gateway.admission import (
     AdmissionController,
     AdmissionDeadlineExceeded,
+    AdmissionDraining,
     AdmissionRejected,
     AdmissionState,
     AdmissionTimedOut,
@@ -259,3 +260,28 @@ async def test_disconnect_while_queued_removes_ticket():
     await wait_until(lambda: controller.stats().queued_total == 0)
     assert controller.stats().active_total == 1
     controller.release(first)
+
+
+async def test_draining_rejects_new_work_but_finishes_existing_ticket():
+    controller = make_controller(max_in_flight=1, max_queue_size=1)
+    ticket = await controller.acquire("a")
+    controller.mark_draining("a")
+    with pytest.raises(AdmissionDraining):
+        controller.try_acquire("a")
+    with pytest.raises(AdmissionDraining):
+        await controller.acquire("a")
+    assert await controller.wait_idle("a", timeout_s=0.01) is False
+    controller.release(ticket)
+    assert await controller.wait_idle("a", timeout_s=0.1) is True
+    controller.cancel_draining("a")
+    resumed = controller.try_acquire("a")
+    assert resumed is not None
+    controller.release(resumed)
+
+
+async def test_wait_all_idle_times_out_and_recovers():
+    controller = make_controller(max_in_flight=1, max_queue_size=0)
+    ticket = await controller.acquire("a")
+    assert await controller.wait_all_idle(0.01) is False
+    controller.release(ticket)
+    assert await controller.wait_all_idle(0.1) is True

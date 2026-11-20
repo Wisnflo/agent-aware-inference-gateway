@@ -319,3 +319,168 @@ def test_keepalive_limit_must_not_exceed_connection_limit():
             max_connections_per_backend=4,
             max_keepalive_connections=8,
         )
+
+
+def test_prefix_defaults_and_valid_values():
+    config = config_from_mapping(
+        {"backends": [{"id": "a", "url": "http://127.0.0.1:1"}]}
+    )
+    assert config.prefix.chunk_chars == 128
+    assert config.prefix.min_match_chars == 128
+    assert config.prefix.max_nodes == 100000
+
+    config = config_from_mapping(
+        {
+            "backends": [{"id": "a", "url": "http://127.0.0.1:1"}],
+            "server": {"strategy": "prefix_affinity"},
+            "prefix": {
+                "chunk_chars": 64,
+                "min_match_chars": 32,
+                "max_nodes": 1000,
+            },
+        }
+    )
+    assert config.strategy == "prefix_affinity"
+    assert config.prefix.chunk_chars == 64
+    assert config.prefix.min_match_chars == 32
+    assert config.prefix.max_nodes == 1000
+
+
+def test_prefix_invalid_values_rejected():
+    with pytest.raises(ConfigError, match="chunk_chars"):
+        config_from_mapping(
+            {
+                "backends": [{"id": "a", "url": "http://127.0.0.1:1"}],
+                "prefix": {"chunk_chars": 0},
+            }
+        )
+    with pytest.raises(ConfigError, match="min_match_chars"):
+        config_from_mapping(
+            {
+                "backends": [{"id": "a", "url": "http://127.0.0.1:1"}],
+                "prefix": {"min_match_chars": -1},
+            }
+        )
+    with pytest.raises(ConfigError, match="max_nodes"):
+        config_from_mapping(
+            {
+                "backends": [{"id": "a", "url": "http://127.0.0.1:1"}],
+                "prefix": {"max_nodes": 1.5},
+            }
+        )
+    with pytest.raises(ConfigError, match="unknown prefix keys"):
+        config_from_mapping(
+            {
+                "backends": [{"id": "a", "url": "http://127.0.0.1:1"}],
+                "prefix": {"chunk": 8},
+            }
+        )
+
+
+def test_kv_cache_aware_strategy_accepted():
+    config = config_from_mapping(
+        {
+            "server": {"strategy": "kv_cache_aware"},
+            "backends": [{"id": "a", "url": "http://127.0.0.1:1"}],
+        }
+    )
+    assert config.strategy == "kv_cache_aware"
+
+
+def test_hardening_defaults():
+    config = config_from_mapping(
+        {"backends": [{"id": "a", "url": "http://127.0.0.1:18090"}]}
+    )
+    assert config.max_request_body_bytes == 1_048_576
+    assert config.drain_timeout_s == 30.0
+    assert config.shutdown_timeout_s == 10.0
+    assert config.health.timeout_s == 2.0
+    assert config.prefix.ttl_seconds == 900.0
+    assert config.prefix.tokenizer_url is None
+    assert config.prefix.min_match_tokens == 16
+    assert config.admin.token is None
+
+
+def test_hardening_values_from_mapping():
+    config = config_from_mapping(
+        {
+            "server": {
+                "max_request_body_bytes": 2048,
+                "drain_timeout_s": 5,
+                "shutdown_timeout_s": 2.5,
+            },
+            "health": {"timeout_s": 0.5},
+            "prefix": {
+                "ttl_seconds": 0,
+                "tokenizer_url": "http://127.0.0.1:18090",
+                "min_match_tokens": 8,
+                "tokenizer_timeout_s": 0.25,
+                "tokenizer_cache_entries": 32,
+            },
+            "admin": {"token": "secret"},
+            "backends": [{"id": "a", "url": "http://127.0.0.1:18090"}],
+        }
+    )
+    assert config.max_request_body_bytes == 2048
+    assert config.drain_timeout_s == 5.0
+    assert config.shutdown_timeout_s == 2.5
+    assert config.health.timeout_s == 0.5
+    assert config.prefix.ttl_seconds == 0.0
+    assert config.prefix.tokenizer_url == "http://127.0.0.1:18090"
+    assert config.prefix.min_match_tokens == 8
+    assert config.prefix.tokenizer_timeout_s == 0.25
+    assert config.prefix.tokenizer_cache_entries == 32
+    assert config.admin.token == "secret"
+    assert "secret" not in repr(config.admin)
+
+
+def test_hardening_invalid_values_rejected():
+    base = {"backends": [{"id": "a", "url": "http://127.0.0.1:18090"}]}
+    with pytest.raises(ConfigError, match="max_request_body_bytes"):
+        config_from_mapping({**base, "server": {"max_request_body_bytes": 0}})
+    with pytest.raises(ConfigError, match="ttl_seconds"):
+        config_from_mapping({**base, "prefix": {"ttl_seconds": -1}})
+    with pytest.raises(ConfigError, match="tokenizer_url"):
+        config_from_mapping({**base, "prefix": {"tokenizer_url": "file:///x"}})
+    with pytest.raises(ConfigError, match="tokenizer_timeout_s"):
+        config_from_mapping(
+            {
+                **base,
+                "prefix": {
+                    "tokenizer_url": "http://127.0.0.1:1",
+                    "tokenizer_timeout_s": 0,
+                },
+            }
+        )
+    config = config_from_mapping({**base, "admin": {"token": ""}})
+    assert config.admin.token is None
+
+
+def test_prefix_load_overflow_threshold_config():
+    base = {"backends": [{"id": "a", "url": "http://127.0.0.1:18090"}]}
+    default_cfg = config_from_mapping(base)
+    assert default_cfg.prefix.load_overflow_threshold == 0
+
+    custom_cfg = config_from_mapping(
+        {**base, "prefix": {"load_overflow_threshold": 4}}
+    )
+    assert custom_cfg.prefix.load_overflow_threshold == 4
+
+    with pytest.raises(ConfigError, match="load_overflow_threshold"):
+        config_from_mapping({**base, "prefix": {"load_overflow_threshold": -1}})
+    with pytest.raises(ConfigError, match="load_overflow_threshold"):
+        config_from_mapping({**base, "prefix": {"load_overflow_threshold": True}})
+
+
+def test_prefix_token_block_size_config():
+    base = {"backends": [{"id": "a", "url": "http://127.0.0.1:18090"}]}
+    default_cfg = config_from_mapping(base)
+    assert default_cfg.prefix.token_block_size == 16
+
+    custom_cfg = config_from_mapping({**base, "prefix": {"token_block_size": 32}})
+    assert custom_cfg.prefix.token_block_size == 32
+
+    with pytest.raises(ConfigError, match="token_block_size"):
+        config_from_mapping({**base, "prefix": {"token_block_size": 0}})
+    with pytest.raises(ConfigError, match="token_block_size"):
+        config_from_mapping({**base, "prefix": {"token_block_size": False}})

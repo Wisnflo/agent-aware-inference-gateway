@@ -71,10 +71,13 @@ class FakeBackend:
     release: asyncio.Event = field(default_factory=asyncio.Event)
     disconnected: asyncio.Event = field(default_factory=asyncio.Event)
     health_ok: bool = True
+    health_delay: float = 0.0
     sent_events: int = 0
 
     def app(self) -> Starlette:
         async def health(request: Request) -> JSONResponse:
+            if self.health_delay:
+                await asyncio.sleep(self.health_delay)
             if not self.health_ok:
                 return JSONResponse({"status": "down"}, status_code=503)
             return JSONResponse({"status": "ok"})
@@ -113,11 +116,42 @@ class FakeBackend:
                 headers={"x-fake-backend": self.name},
             )
 
+        async def models(request: Request) -> JSONResponse:
+            self.requests.append(
+                {"body": None, "headers": dict(request.headers), "path": request.url.path}
+            )
+            return JSONResponse({"data": [{"id": "fake-model", "object": "model"}]})
+
+        async def slots(request: Request) -> JSONResponse:
+            return JSONResponse(
+                [
+                    {
+                        "id": 0,
+                        "is_processing": False,
+                        "n_ctx": 4096,
+                        "n_prompt_tokens": 12,
+                        "n_prompt_tokens_processed": 2,
+                        "n_prompt_tokens_cache": 10,
+                    }
+                ]
+            )
+
+        async def tokenize(request: Request) -> JSONResponse:
+            payload = await request.json()
+            content = payload.get("content", "")
+            tokens = [ord(char) for char in str(content)[:1024]]
+            return JSONResponse({"tokens": tokens})
+
         return Starlette(
             routes=[
                 Route("/health", health, methods=["GET"]),
                 Route("/completion", completion, methods=["POST"]),
                 Route("/v1/chat/completions", completion, methods=["POST"]),
+                Route("/v1/completions", completion, methods=["POST"]),
+                Route("/v1/embeddings", completion, methods=["POST"]),
+                Route("/v1/models", models, methods=["GET"]),
+                Route("/slots", slots, methods=["GET"]),
+                Route("/tokenize", tokenize, methods=["POST"]),
             ]
         )
 
