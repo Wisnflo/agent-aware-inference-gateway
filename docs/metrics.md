@@ -28,6 +28,16 @@
 | `gateway_backend_health{backend}` | 经启动检查或运行时去抖后的健康状态，1 为可路由，0 为已摘除 |
 | `gateway_backend_removed_total{backend}`、`gateway_backend_restored_total{backend}` | 运行时健康摘除和恢复次数，不含启动转换 |
 | `gateway_routing_failovers_total{from_backend,to_backend}` | 路由时因首选不健康而选择备用后端的次数 |
+| `gateway_prefix_routing_total{strategy,result}` | 前缀策略的结果：`hit`（文本前缀命中）、`verified`（另有 `cache_n > 0` 证据）、`fallback`（无可用前缀匹配） |
+| `gateway_prefix_match_chars{backend}` | 前缀命中字符数直方图；是字符块近似，不是模型 token |
+| `gateway_prefix_match_tokens{backend}` | tokenizer 模式下的前缀命中 token 数直方图 |
+| `gateway_cache_evidence_total{backend,result}` | 从 `timings.cache_n` 观察到的缓存证据：`hit`/`miss` |
+| `gateway_prefix_trie_nodes`、`gateway_prefix_verified_entries` | 当前 trie 节点数和仍有效的 verified 关联数 |
+| `gateway_prefix_evictions_total{reason}` | trie 淘汰次数：`ttl`、`lru` 或 `reset` |
+| `gateway_retry_prefix_preserved_total{strategy}` | 重试落到持有相同前缀的后端的次数 |
+| `gateway_request_body_rejected_total{route}` | 请求体超过上限、在准入前被 413 拒绝的次数 |
+| `gateway_backend_draining{backend}` | 后端是否处于 draining，1 为不再接收新请求 |
+| `gateway_admin_requests_total{action,result}`、`gateway_admin_auth_failures_total` | admin 操作结果和 bearer token 校验失败次数；不记录 token |
 
 `gateway_requests_total` 与 admission、retry、upstream error 的分母不同，不能直接相加计算总请求数。`/health` 和 `/metrics` 本身不计为推理请求。
 
@@ -68,6 +78,10 @@ cache_hit_pct = 100 × Σcache_n / Σ(cache_n + prompt_n)
 ```
 
 不要用缓存 token 除以后端的 fresh-prefill counter。引擎版本改变后，应从原始事件与后端快照重新核对计数语义。比较不同 workload 时还需报告提示长度、冷会话数与后端分布。
+
+`gateway_cache_evidence_total` 是路由学习信号，不是额外的 token 分母；一次响应只应产生一个 timing 观察。前缀命中字符数和 `cache_n` 都不能证明具体 KV block 位置。
+
+`gateway_cache_evidence_total` 是路由学习信号，不是额外的 token 分母；一次响应只应产生一个 timing 观察。前缀命中字符数和 `cache_n` 都不能证明具体 KV block 位置。
 
 ## 状态码与失败类型
 

@@ -1,12 +1,14 @@
 # Agent-Aware Inference Gateway
 
-面向本地 `llama.cpp` 的 Python asyncio 推理网关，提供会话亲和路由、有界准入和 SSE 转发。项目重点是请求从排队到结束的资源管理，以及超时、断连和后端故障下的行为验证。
+面向本地 `llama.cpp` 的 Python asyncio 推理网关，提供会话亲和、前缀/KV 缓存感知路由、有界准入和 SSE 转发。项目重点是请求从排队到结束的资源管理，以及超时、断连和后端故障下的行为验证。
 
 ## 解决什么问题
 
 Agent 的多轮请求往往重复携带相同上下文。轮询把同一会话分散到不同推理进程，会减少已有前缀缓存的复用机会；会话亲和则可能把负载集中到某个后端。网关用 `X-Session-ID` 保持会话归属，通过全局和后端并发限制、有界等待队列控制拥塞，并分别记录排队、执行和流式结束原因。
 
-实现参考 [vLLM Router 的 routing design](https://github.com/vllm-project/production-stack/tree/main/src/vllm_router)。Session affinity、rendezvous hashing 和健康过滤都是已有方法，项目贡献是针对本地推理场景的工程实现与故障验证，不包含新路由算法。`Agent-Aware` 在这里指显式会话标识；网关不解析 Agent 工作流或工具调用。
+实现参考 [vLLM Router 的 routing design](https://github.com/vllm-project/production-stack/tree/main/src/vllm_router)。Session affinity、rendezvous hashing、文本前缀哈希和健康过滤都是已有方法，项目贡献是针对本地推理场景的工程实现与故障验证，不包含新路由算法。`Agent-Aware` 在这里指显式会话标识；网关不解析 Agent 工作流或工具调用。
+
+最新的 `prefix_affinity` / `kv_cache_aware` 路由和运行时后端注册说明见[前缀路由](docs/prefix-routing.md)。
 
 ## 架构
 
@@ -14,10 +16,11 @@ Agent 的多轮请求往往重复携带相同上下文。轮询把同一会话�
 
 展示图对应的结构保留在可编辑的 [Mermaid 文件](docs/assets/architecture.mmd)和 [SVG 图](docs/assets/architecture.svg)中。[架构说明](docs/architecture.md)列出模块职责、重试边界和资源所有权。
 
-- **路由**：`round_robin` 与 `session_affinity`；后者对 `X-Session-ID` 做 SHA-256 rendezvous hashing，缺少会话标识时使用轮询。
-- **准入**：先选后端，再申请容量；全局和后端并发上限、有界队列、后端内 FIFO。
-- **生命周期**：固定的请求期限和执行期限；仅连接建立前的失败可以重试，SSE 开始后不切换后端。
-- **转发与观测**：原生 `/completion`、OpenAI 兼容 `/v1/chat/completions`；JSON 和 SSE；`/health` 与 Prometheus `/metrics`。
+- **路由**：`round_robin`、`session_affinity`、`prefix_affinity`、`kv_cache_aware`。会话亲和使用 `X-Session-ID` 的 SHA-256 rendezvous；前缀策略默认对 prompt 文本分块做 SHA-256 trie，配置 `tokenizer_url` 后改用 llama.cpp `/tokenize` 的 token id；`kv_cache_aware` 只用观测到的 llama.cpp `cache_n` 作为“已验证缓存”证据，不声称知道 KV block 位置。TTL/LRU 限制 trie 状态，避免无限增长。
+- **动态后端**：loopback-only admin API 可在运行时添加/删除/排水（drain）后端，并触发即时健康探测；路由和准入增量更新，前缀 trie 的学习状态不会因增删后端整体清空。
+- **准入**：先选后端，再申请容量；全局和后端并发上限、有界队列、后端内 FIFO；请求体超过上限在准入前返回 413。
+- **生命周期**：固定的请求期限和执行期限；仅连接建立前的失败可以重试，重试会优先选择持有相同前缀的后端；SSE 开始后不切换后端。drain 和进程关闭会等待存量请求完成。
+- **转发与观测**：原生 `/completion`、OpenAI 兼容 `/v1/chat/completions`、`/v1/completions`、`/v1/embeddings` 和 `/v1/models`；JSON 和 SSE；请求 ID 贯穿日志、响应和上游；`/health` 与 Prometheus `/metrics`。
 
 默认只监听 `127.0.0.1`，采用单进程和静态后端。完整边界见[限制](docs/limitations.md)。
 
@@ -65,6 +68,24 @@ curl --fail-with-body http://127.0.0.1:18080/metrics
 
 使用 Ctrl-C 停止网关，再执行 `./scripts/stop_backends.sh`。详细请求示例、真实 E2E 和故障演练见[运行手册](docs/runbook.md)。
 
+## 运行时后端管理
+
+默认仅接受 loopback 客户端的 admin 请求，没有额外鉴权。配置 `admin.token` 或环境变量 `GATEWAY_ADMIN_TOKEN` 后，请求还必须带 `Authorization: Bearer <token>`。不要把网关直接暴露到不可信网络。
+
+```bash
+curl -s http://127.0.0.1:18080/admin/backends
+curl -s -X POST http://127.0.0.1:18080/admin/backends \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"c","url":"http://127.0.0.1:18092"}'
+curl -s -X DELETE http://127.0.0.1:18080/admin/backends/c
+curl -s -X POST 'http://127.0.0.1:18080/admin/backends/c/drain?timeout_s=30'
+curl -s -X POST http://127.0.0.1:18080/admin/backends/c/undrain
+curl -s -X POST http://127.0.0.1:18080/admin/health/check
+curl -s http://127.0.0.1:18080/admin/cache
+```
+
+添加/删除会增量更新后端池、准入容量和 router；有 active/queued 请求的后端不能直接删除，最后一个后端不能删除。`drain` 先把后端从新路由中排除，等待存量请求结束（超时返回 409 并保持 draining），然后删除；`undrain` 可取消尚未完成的 drain。前缀 trie 的既有学习状态会保留，新后端从空状态开始。所有 admin 操作写入带 request id 的审计日志。`/admin/cache` 只汇总 llama.cpp `/slots` 的缓存 token 计数供观察，不提供前缀身份，也不参与路由。
+
 ## 测试与证据
 
 ```bash
@@ -76,7 +97,7 @@ LLAMA_ARG_DEVICE=none LLAMA_ARG_N_GPU_LAYERS=0 \
 uv run --locked pytest -q -m real_backend
 ```
 
-单元测试覆盖路由、配置、准入状态机与 SSE 分帧。HTTP 集成测试启动真实 Uvicorn 和可控假后端，检查增量转发、容量回收和故障交错；真实后端测试用于确认 llama.cpp 协议兼容及会话缓存复用。修复后的本次执行记录集中在[发布验证记录](docs/release-verification.md)，不引用仓库外研究材料作为公开验收证据。
+单元测试覆盖路由、配置、准入状态机与 SSE 分帧。HTTP 集成测试启动真实 Uvicorn 和可控假后端，检查增量转发、容量回收和故障交错；真实后端测试用于确认 llama.cpp 协议兼容及会话缓存复用。当前版本的执行记录集中在[发布验证记录](docs/release-verification.md)；可发布测试摘要与 Benchmark 摘要在[evidence](evidence/README.md)，完整 Week 4 原始数据保留在工作区研究目录，不作为当前版本的验收依据。
 
 测试通过只覆盖相应用例。网关任务结束、上游连接关闭和推理引擎内部停止计算是不同层次；当前证据不证明所有内部 KV 或 slot 操作均已取消。
 
@@ -91,6 +112,11 @@ uv run --locked python -m bench.run_admission_bench --repeat 5 \
 uv run --locked python -m bench.run_reliability_bench --repeat 5 \
   --outdir bench/results/reliability
 uv run --locked python -m bench.run_soak --outdir bench/results/soak
+
+# Prefix routing comparison: no session IDs, 7 exact prompts x 4 rounds
+uv run --locked python -m bench.run_bench --repeat 5 \
+  --workloads prefix --strategies b0,p1,kv --skip-overhead \
+  --outdir bench/results/prefix
 ```
 
 这些命令共享后端端口，应依次执行。B0 为轮询，B1 为会话亲和；比较固定模型、提示与请求顺序，每个策略和重复轮次重启后端及网关。原始记录与环境信息由脚本写入输出目录。
@@ -99,7 +125,7 @@ uv run --locked python -m bench.run_soak --outdir bench/results/soak
 
 ## 使用范围与限制
 
-该项目适合作为受信任本机环境中的工程实验和学习展示。它没有鉴权、TLS 终止和多租户隔离，也没有请求体大小限制、完整熔断器或 Kubernetes 服务发现。会话亲和不等于负载均衡，也不感知前缀内容或 KV-cache 位置。单机 0.5B 模型结果不能外推至 GPU 生产服务。
+该项目适合作为受信任本机环境中的工程实验和学习展示。它没有 TLS 终止、多租户隔离、完整熔断器或 Kubernetes 服务发现；admin 只有 loopback 限制和可选 bearer token。请求体有上限，但非流式响应仍完整读入内存。会话亲和不等于负载均衡；前缀/token 亲和是本地近似，不感知真实 KV block 位置。单机 0.5B 模型结果不能外推至 GPU 生产服务。
 
 部署边界、流式状态码和健康恢复行为见[限制](docs/limitations.md)；指标含义见[指标说明](docs/metrics.md)。[工程讲解提纲](docs/engineering-review.md)可用于准备代码演示。
 

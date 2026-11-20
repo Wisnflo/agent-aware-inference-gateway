@@ -8,11 +8,12 @@ Benchmark 用于比较会话路由行为、准入效果和故障响应。当前 
 
 CPU 运行显式使用 `--device none --no-op-offload -ngl 0`；命令示例同时设置 `LLAMA_ARG_DEVICE=none`、`LLAMA_ARG_N_GPU_LAYERS=0`。启动参数固定线程数、context 和 parallel 配置。构建启用或禁用 Metal 的选项不等同于运行时设备证明。
 
-路由比较中 B0 为 `round_robin`，B1 为 `session_affinity`。二者使用相同请求体、会话头和顺序；相同模型、后端参数及端口；每个策略和重复轮次重启后端和网关，使缓存与计数从相同状态开始。路由 workload 的并发为 1，`n_predict=1`、`temperature=0`、`seed=42`、`cache_prompt=true`。
+路由比较中 B0 为 `round_robin`，B1 为 `session_affinity`，P1 为 `prefix_affinity`，KV 为 `kv_cache_aware`。各策略使用相同请求体、顺序；需要会话头的 workload 使用相同会话头；相同模型、后端参数及端口；每个策略和重复轮次重启后端和网关，使缓存与计数从相同状态开始。路由 workload 的并发为 1，`n_predict=1`、`temperature=0`、`seed=42`、`cache_prompt=true`。
 
 - `sequential`：同一会话的多轮请求连续到达。
 - `shuffled`：固定种子打乱请求次序。
 - `negative`：没有共享会话前缀的对照。
+- `prefix`：7 个精确长 prompt 各重复 4 轮，不带 `X-Session-ID`；用于比较 round-robin、prefix affinity 与 cache-aware 路由。
 
 ## 运行
 
@@ -29,6 +30,10 @@ uv run --locked python -m bench.run_admission_bench --repeat 5 \
 uv run --locked python -m bench.run_reliability_bench --repeat 5 \
   --outdir bench/results/reliability
 uv run --locked python -m bench.run_soak --outdir bench/results/soak
+
+uv run --locked python -m bench.run_bench --repeat 5 \
+  --workloads prefix --strategies b0,p1,kv --skip-overhead \
+  --outdir bench/results/prefix
 ```
 
 路由脚本输出 `meta.json`、`raw.json`、`summary.json`、`overhead.json` 和日志；其他脚本按场景输出原始记录、摘要或时间序列。公开前检查元数据和日志中的本机路径，并只保留支持公开结论所需的材料。
@@ -51,7 +56,8 @@ cache_hit_pct = 100 × Σcache_n / Σ(cache_n + prompt_n)
 
 ## 可支持的结论
 
-- 路由比较可说明特定会话结构下的缓存复用与负载分布，不能证明新算法或普遍性能优势。
+- 路由比较可说明特定会话/前缀结构下的缓存复用与负载分布，不能证明新算法或普遍性能优势。
+- 前缀比较使用字符块而非模型 token；当前 7 前缀 × 4 轮、5 次重复中 B0 为 50.229%，P1/KV 为 74.938%，首内容 p50 约 259 ms vs 9.7–9.9 ms。该结果只说明重复 prompt 不被轮询分散，不外推到不同前缀数、后端数或淘汰压力。可选的 `/tokenize` token 模式只做了真实功能验证，未重跑该性能矩阵；tokenizer 调用、缓存和不同 tokenizer 实现会改变延迟。
 - 准入比较可说明执行与排队上限、拒绝和等待时间，不预设吞吐或 p95 改善。
 - 故障比较可说明健康摘除、迁移及网关容量回收，不证明推理引擎内部取消。
 - Soak 记录短时运行中的容量和进程资源变化，不等同于长期稳定性认证。

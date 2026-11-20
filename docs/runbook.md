@@ -87,11 +87,17 @@ curl --fail-with-body -i http://127.0.0.1:18080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"Say hello."}],"max_tokens":8}'
 
+curl --fail-with-body -i http://127.0.0.1:18080/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Say hello.","max_tokens":8}'
+
+curl --fail-with-body -i http://127.0.0.1:18080/v1/models
+
 curl --fail-with-body http://127.0.0.1:18080/health
 curl --fail-with-body http://127.0.0.1:18080/metrics
 ```
 
-`X-Gateway-Backend` 给出实际后端，`X-Gateway-Queue-Ms` 给出等待时间。先确认原生 SSE 收到完整 `stop: true` 事件，再把它算作正常完成；`curl` 的退出码和 HTTP 200 不能单独判断流式完成。
+请求可带 `X-Request-ID`；网关会校验形状，写入响应头、日志和上游请求，否则生成一个新 ID。`X-Gateway-Backend` 给出实际后端，`X-Gateway-Queue-Ms` 给出等待时间。先确认原生 SSE 收到完整 `stop: true` 事件，再把它算作正常完成；`curl` 的退出码和 HTTP 200 不能单独判断流式完成。
 
 ## 真实 E2E
 
@@ -103,13 +109,39 @@ LLAMA_ARG_DEVICE=none LLAMA_ARG_N_GPU_LAYERS=0 \
 uv run --locked pytest -q -m real_backend
 ```
 
-可设置 `GATEWAY_E2E_PORTS=18190,18191` 改测试端口。测试检查原生 JSON、SSE、会话缓存复用和 OpenAI 兼容端点；读取控制台结果，确认没有因缺少资源而 skip。首次下载、模型加载和机器负载会影响耗时。该测试验证协议与功能，不是性能测量或内部推理取消证明。
+可设置 `GATEWAY_E2E_PORTS=18190,18191` 改测试端口。测试检查原生 JSON、SSE、会话缓存复用、tokenizer 前缀和 OpenAI 兼容端点；读取控制台结果，确认没有因缺少资源而 skip。首次下载、模型加载和机器负载会影响耗时。该测试验证协议与功能，不是性能测量或内部推理取消证明。
 
 无需模型的测试：
 
 ```bash
 uv run --locked pytest -q tests bench/tests -m 'not real_backend'
 ```
+
+## 运行时后端与健康
+
+Admin 端点只接受 loopback 请求。配置 `admin.token` 或环境变量 `GATEWAY_ADMIN_TOKEN` 后，还需要 `Authorization: Bearer <token>`：
+
+```bash
+export GATEWAY_ADMIN_TOKEN='choose-a-local-secret'
+curl -s -H "Authorization: Bearer $GATEWAY_ADMIN_TOKEN" \
+  http://127.0.0.1:18080/admin/backends
+curl -s -H "Authorization: Bearer $GATEWAY_ADMIN_TOKEN" \
+  -X POST http://127.0.0.1:18080/admin/backends \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"c","url":"http://127.0.0.1:18092"}'
+curl -s -H "Authorization: Bearer $GATEWAY_ADMIN_TOKEN" \
+  -X POST http://127.0.0.1:18080/admin/health/check
+curl -s -H "Authorization: Bearer $GATEWAY_ADMIN_TOKEN" \
+  -X POST 'http://127.0.0.1:18080/admin/backends/c/drain?timeout_s=30'
+curl -s -H "Authorization: Bearer $GATEWAY_ADMIN_TOKEN" \
+  -X POST http://127.0.0.1:18080/admin/backends/c/undrain
+curl -s -H "Authorization: Bearer $GATEWAY_ADMIN_TOKEN" \
+  -X DELETE http://127.0.0.1:18080/admin/backends/c
+curl -s -H "Authorization: Bearer $GATEWAY_ADMIN_TOKEN" \
+  http://127.0.0.1:18080/admin/cache
+```
+
+添加后端会先探测；删除要求该后端没有 active/queued 请求且不是最后一个。添加/删除会增量更新 router，保留其余后端的前缀状态。`drain` 先停止新路由并等待存量请求，超时返回 409 且保持 draining；`undrain` 取消 draining。`/admin/cache` 只读取 llama.cpp `/slots` 的缓存 token 计数，不提供前缀身份。不要把 admin 端点暴露到非受信网络。
 
 ## 健康迁移与期限演练
 

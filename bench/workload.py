@@ -87,6 +87,35 @@ def negative_requests() -> list[WorkloadRequest]:
     return requests
 
 
+def prefix_repeat_requests() -> list[WorkloadRequest]:
+    """Repeated exact prompts without session IDs.
+
+    Seven long prefixes are each sent four times.  Round-robin alternates the
+    backend on every round; prefix-aware routing can keep each prefix on the
+    backend that already saw it.
+    """
+    prefixes = []
+    for index in range(7):
+        unique = (
+            "Prefix workload %d has a fixed long context for cache routing. "
+            "Keep the same policy and use the same budget assumptions. "
+            % index
+        )
+        prefixes.append(unique * 14 + " Answer with one short token.")
+    requests = []
+    for repeat in range(4):
+        for index, prompt in enumerate(prefixes):
+            requests.append(
+                WorkloadRequest(
+                    session="",
+                    turn=repeat,
+                    prompt=prompt,
+                    request_id=f"p{index}-r{repeat}",
+                )
+            )
+    return requests
+
+
 WORKLOADS = {
     "sequential": (
         sequential_requests,
@@ -99,6 +128,10 @@ WORKLOADS = {
     "negative": (
         negative_requests,
         "15 sessions x 4 unique-prefix requests; affinity cannot reuse cache.",
+    ),
+    "prefix": (
+        prefix_repeat_requests,
+        "7 exact long prompts x 4 rounds without session IDs; prefix routing can reuse cache.",
     ),
 }
 

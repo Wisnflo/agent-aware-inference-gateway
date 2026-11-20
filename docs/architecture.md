@@ -4,25 +4,28 @@
 
 ![请求、控制与观测路径](assets/architecture-overview.png)
 
-展示图突出网关边界和数据流；[Mermaid 源文件](assets/architecture.mmd)及其 [SVG 图](assets/architecture.svg)保留可编辑结构。实线表示请求或响应数据路径，虚线表示健康状态和观测数据。图中两个后端运行相同模型，健康探测与推理共用各后端的 HTTPX 客户端。展示图的返回箭头指向同一客户端；健康探测到后端的 HTTP 交互从图中省略。
+展示图突出网关边界和数据流；[Mermaid 源文件](assets/architecture.mmd)及其 [SVG 图](assets/architecture.svg)保留可编辑结构。实线表示请求或响应数据路径，虚线表示健康状态和观测数据。图中两个后端运行相同模型；健康探测使用独立于推理的 HTTPX 客户端，展示图省略了这条独立探测连接。
 
 ## 模块职责
 
 | 模块 | 职责 |
 |---|---|
-| `server.py` | 四个 HTTP 路由、应用 lifespan、CLI、健康摘要 |
+| `server.py` | HTTP 路由、应用 lifespan、admin 鉴权/审计、CLI、健康摘要 |
 | `config.py` | TOML 读取与启动前校验 |
-| `router.py` | 轮询、会话亲和、健康过滤和故障迁移决策 |
-| `admission.py` | 容量、等待队列、准入票据及终态 |
-| `backends.py` | HTTP 客户端连接池、健康探测与状态去抖 |
-| `proxy.py` | 转发、期限、取消、重试与资源清理 |
+| `router.py` | 轮询、会话亲和、前缀亲和、KV-cache-aware、健康过滤和故障迁移决策 |
+| `prefix.py` | prompt 提取、SHA-256 字符块/token trie、TTL/LRU、缓存命中证据 |
+| `tokenizer.py` | 可选的 llama.cpp `/tokenize` 客户端与有界缓存 |
+| `admission.py` | 容量、等待队列、准入票据、drain 与终态 |
+| `backends.py` | 推理/探测 HTTP 客户端、健康探测与状态去抖 |
+| `proxy.py` | 转发、请求体上限、期限、取消、重试与资源清理 |
+| `middleware.py` | `X-Request-ID` 生成/透传与日志上下文 |
 | `sse.py` | 增量事件解析，用于指标观察；转发保留原始字节 |
 | `metrics.py` | Prometheus 指标注册与导出 |
 
 ## 从到达到结束
 
-1. `/completion` 或 `/v1/chat/completions` 的已匹配路由决定上游端点。读取请求体，提取会话标识；请求体完整读入内存后再转发。
-2. Router 在健康后端中选择目标。`session_affinity` 的首选后端由全部配置后端决定；首选不可用时，在健康子集中重新选择。恢复后立即回到原首选。
+1. `/completion`、`/v1/chat/completions`、`/v1/completions` 或 `/v1/embeddings` 的已匹配路由决定上游端点。请求体按 `max_request_body_bytes` 流式读取；超限在准入前返回 413。`/v1/models` 是只读转发，不占用推理容量。
+2. 若配置了 `prefix.tokenizer_url`，先调用 llama.cpp `/tokenize` 得到 token id；失败则回退到字符块。Router 在健康后端中选择目标。`session_affinity` 的首选后端由全部配置后端决定；首选不可用时，在健康子集中重新选择。`prefix_affinity` 匹配曾服务该前缀的后端；`kv_cache_aware` 另外优先有真实 `cache_n > 0` 证据的后端。没有可用前缀匹配时回退到会话/轮询。恢复后立即回到原首选。
 3. Admission controller 申请全局和目标后端容量。容量不足时进入有界队列；队列已满返回 `429 queue_full`。等待队列按后端保持 FIFO，跨后端选择最早可执行的等待者。
 4. 获得票据后，通过该后端的长连接池发送请求。JSON 完整读取后返回；SSE 按上游字节块逐步转发，指标解析与转发内容分开。
 5. JSON 正文读完即释放后端票据，下游发送仍受固定期限约束；SSE 持有票据至流结束。失败路径回收票据并关闭未移交的上游响应。票据释放幂等，SSE 的响应级清理还覆盖迭代器未启动的退出路径。
@@ -40,7 +43,7 @@ winner = argmax(score, backend_id)
 
 SHA-256 使映射不受 Python 字符串哈希随机化影响；后端 ID 作为相同分数的稳定次序。缺少或为空的 `X-Session-ID` 使用轮询。路由先于准入，拒绝也会推进轮询计数；排队期间不主动迁移后端。
 
-会话标识不代表前缀内容或 KV-cache 位置，路由不会读取提示词来匹配前缀。设计参考 [vLLM Router](https://github.com/vllm-project/production-stack/tree/main/src/vllm_router)，实现范围与来源见[第三方说明](third-party.md)。
+前缀策略会读取提示词以构建字符块或 token 前缀；它仍然不知道 KV block 位置。文本/ token 匹配和 `cache_n > 0` 证据分开记录，前者不冒充后者。设计参考 [vLLM Router](https://github.com/vllm-project/production-stack/tree/main/src/vllm_router)，实现范围与来源见[第三方说明](third-party.md)。
 
 ## 期限与重试
 
@@ -61,7 +64,13 @@ execution_deadline = min(request_deadline, first_admission + execution_timeout_m
 
 启动探测按一次结果确定初始健康状态。运行时连续 `failure_threshold` 次失败摘除，连续 `success_threshold` 次成功恢复；网络错误也会计入失败。单次业务 5xx 不改变健康状态。
 
-没有健康后端时返回 `503 no_healthy_backend`。Session affinity 的恢复采用立即 failback，可能再次损失缓存并集中负载。健康探测使用同一个 HTTPX 池，连接池拥塞会影响探测时效。
+没有健康后端时返回 `503 no_healthy_backend`。恢复采用立即 failback，可能再次损失缓存并集中负载。健康状态也会从成功的业务响应得到恢复信号，但已健康的后端不会因单次业务成功重置探测失败计数。loopback admin 端点可立即触发探测。健康探测使用独立 HTTPX 客户端和 `health.timeout_s` 总超时，推理连接池饱和不会直接耗尽探测连接。
+
+运行时可通过 `/admin/backends` 增加/删除后端；删除要求该后端没有 active/queued 请求，且不能删除最后一个后端。`/drain` 先停止新路由、等待存量完成后删除；超时保持 draining，`/undrain` 可恢复。router、准入和前缀 trie 都增量更新，保留其余后端的学习状态。drain 和进程关闭都受 `drain_timeout_s` / `shutdown_timeout_s` 约束。`/admin/cache` 只转发 `/slots` 的缓存 token 计数供观察，不作为路由依据。
+
+## 请求关联
+
+中间件接受形状合法的 `X-Request-ID`，否则生成 32 位十六进制 ID；该 ID 写入响应头、日志上下文和上游请求。`traceparent`/`tracestate` 按普通请求头透传，因此外部 tracing 系统可以把网关 hop 串起来。网关本身不依赖 OpenTelemetry SDK，也不导出 span。
 
 ## SSE 与资源边界
 

@@ -2,6 +2,10 @@
 
 2026-11-03 对本地发行候选执行以下检查。先独立复现旧缺陷，再检查修复后的行为；开发阶段的 Week 1–4 PASS 不作为本次结论依据。当前适合以受信任本机实验项目公开源码和用于实习展示，未上传 GitHub。
 
+## 2026-11-11 后续功能更新
+
+在原有发布验证之后新增了 `prefix_affinity`、`kv_cache_aware`、tokenizer 前缀、TTL/LRU、运行时 loopback admin 注册/鉴权/drain、请求体上限和请求 ID。当前 Python 3.13 无模型测试为 **211 passed / 5 deselected**，真实双后端 E2E 为 **5 passed / 186 deselected**；新增测试覆盖前缀 trie、prompt 提取、KV 证据、tokenizer 回退、admin 添加/删除/排水/鉴权、请求体上限和健康超时。下表的 158 项是 2026-11-03 原发行候选的记录，未改写；新功能的详细设计与结果见[前缀路由](prefix-routing.md)和[Benchmark 口径](benchmarks.md)。
+
 ## 执行结果
 
 | 检查 | 本次结果 |

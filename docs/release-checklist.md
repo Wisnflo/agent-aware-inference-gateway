@@ -2,7 +2,9 @@
 
 **本地准备 6/6 完成。** 当前适合公开为受信任本机实验和实习展示项目。已修复独立审查中确认的缺陷；尚未创建远程仓库、提交本次改动或上传 GitHub。
 
-- [x] **独立仓库。** 发布范围为 `gateway/` 独立 Git 仓库及其必要文档、测试和脚本。源码包不包含父级 AI-develop 研究目录或其他项目；当前没有 Git remote。
+2026-11-14：新增 prefix/KV-cache-aware 路由、tokenizer 前缀、TTL/LRU、loopback 运行时后端注册/鉴权/drain、请求体上限和请求 ID；Python 3.13 无模型测试 211 passed / 5 deselected，真实 E2E 5 passed / 186 deselected。下方 158 项为 2026-11-03 原发行候选记录，保留不改写。
+
+- [x] **独立仓库。** 发布范围为 `agent-aware-inference-gateway/` 独立 Git 仓库及其必要文档、测试和脚本。源码包不包含父级 AI-develop 研究目录或其他项目；当前没有 Git remote。
 - [x] **敏感信息。** 扫描全部 2 个 Git 提交和当前目录，复核交付文件中的凭据、个人路径、环境变量、请求及日志。未发现真实密钥或个人路径进入候选包；公开示例使用本地地址与占位资源路径。原始运行结果留在忽略目录。
 - [x] **模型与二进制。** 不提交约 409 MiB GGUF、llama-server、`.venv`、缓存及原始日志。wheel、sdist 内容检查通过；[运行手册](runbook.md)提供固定引擎提交、构建步骤、模型下载与 SHA-256 校验。
 - [x] **许可证。** 添加 [MIT LICENSE](../LICENSE)，核对当前 Python 依赖、构建依赖、llama.cpp 和所用模型的许可；[第三方说明](third-party.md)明确 vLLM Router 设计参考和实现范围。

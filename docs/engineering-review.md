@@ -22,6 +22,10 @@ Agent 多轮请求携带重复上下文，会话亲和可增加同一推理进�
 | HTTP chunk 和 SSE event 有什么区别？超大事件如何影响指标？ | `sse.py`，分帧和事件上限单元测试 |
 | 为什么票据释放不能依赖 timing 指标和 `aclose()` 成功？ | 异常 timing、重复取消和响应关闭回归测试 |
 | 健康探测为什么去抖？恢复后为什么立即 failback？ | `backends.py`、`router.py`、health 测试 |
+| 前缀 trie 为什么要 TTL 和 LRU？达到上限时为什么不能边遍历边淘汰？ | `prefix.py`、prefix 单元测试 |
+| tokenizer 模式和字符模式有什么区别？tokenizer 失败时请求会怎样？ | `tokenizer.py`、真实 `/tokenize` E2E、hardening 测试 |
+| drain 与直接删除后端的行为差异？drain 超时后状态是什么？ | `admission.py`、`server.py`、admin hardening 测试 |
+| 请求体上限为什么要在准入前检查？请求 ID 如何贯穿日志和上游？ | `proxy.py`、`middleware.py`、hardening 测试 |
 | 请求计数和尝试计数有什么区别？200 SSE 是否成功？ | `metrics.py`、[指标说明](metrics.md) |
 | 如何证明CPU执行与基准可比？如何处理拒绝和截断流？ | `bench/`、[Benchmark 说明](benchmarks.md) |
 

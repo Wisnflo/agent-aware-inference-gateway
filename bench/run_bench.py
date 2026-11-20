@@ -54,7 +54,12 @@ from gateway.sse import SSEEventDecoder, first_content  # noqa: E402
 
 from bench.workload import SEED, WORKLOADS, WorkloadRequest, build_workload  # noqa: E402
 
-STRATEGIES = {"b0": "round_robin", "b1": "session_affinity"}
+STRATEGIES = {
+    "b0": "round_robin",
+    "b1": "session_affinity",
+    "p1": "prefix_affinity",
+    "kv": "kv_cache_aware",
+}
 BACKEND_ARGS = [
     "-c", "4096", "-n", "16", "-t", "4", "--threads-batch", "4",
     "-ngl", "0", "--device", "none", "--no-op-offload",
@@ -325,7 +330,7 @@ async def run_request(
             "POST",
             "/completion",
             json=body,
-            headers={"X-Session-ID": request.session},
+            headers=({"X-Session-ID": request.session} if request.session else {}),
         ) as response:
             record["status"] = response.status_code
             record["backend"] = response.headers.get("x-gateway-backend")
