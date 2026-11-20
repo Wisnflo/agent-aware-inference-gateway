@@ -75,6 +75,10 @@ class ClientDisconnected(AdmissionError):
     """The client went away while its request was waiting for capacity."""
 
 
+class AdmissionDraining(AdmissionError):
+    """The target backend is draining and accepts no new execution work."""
+
+
 @dataclass(eq=False)
 class AdmissionTicket:
     ticket_id: int
@@ -134,9 +138,86 @@ class AdmissionController:
         self._peak_active = 0
         self._peak_queued = 0
         self._on_change = on_change
+        self._draining: set[str] = set()
 
     def set_on_change(self, callback: Callable[[], None] | None) -> None:
         self._on_change = callback
+
+    def mark_draining(self, backend_id: str) -> None:
+        """Stop admitting new work for a backend that is being drained.
+
+        Already admitted requests keep their capacity and queued tickets stay
+        in the FIFO so they can finish; only new admissions are refused.
+        """
+        self._check_backend(backend_id)
+        self._draining.add(backend_id)
+        self._notify()
+
+    def cancel_draining(self, backend_id: str) -> None:
+        self._check_backend(backend_id)
+        self._draining.discard(backend_id)
+        self._notify()
+
+    def is_draining(self, backend_id: str) -> bool:
+        return backend_id in self._draining
+
+    def add_backend(self, backend_id: str, limit: int | None = None) -> None:
+        """Add a backend to an existing controller; no I/O is performed."""
+        if backend_id in self._queues:
+            raise ValueError(f"backend already exists: {backend_id!r}")
+        if limit is None:
+            limit = self.config.max_in_flight
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("backend limit must be a positive integer")
+        if limit > self.config.max_in_flight:
+            raise ValueError("backend limit exceeds max_in_flight")
+        self._backend_ids = self._backend_ids + (backend_id,)
+        self._limits[backend_id] = limit
+        self._active[backend_id] = 0
+        self._queues[backend_id] = deque()
+        self._notify()
+
+    def remove_backend(self, backend_id: str) -> None:
+        """Remove an idle backend. Active/queued work must finish first."""
+        self._check_backend(backend_id)
+        if self._active[backend_id] or self._queues[backend_id]:
+            raise ValueError(f"backend {backend_id!r} still has active or queued work")
+        self._backend_ids = tuple(
+            item for item in self._backend_ids if item != backend_id
+        )
+        del self._limits[backend_id]
+        del self._active[backend_id]
+        del self._queues[backend_id]
+        self._draining.discard(backend_id)
+        self._notify()
+
+    async def wait_idle(
+        self, backend_id: str, timeout_s: float, poll_interval_s: float = 0.02
+    ) -> bool:
+        """Wait until a backend has no active or queued work.
+
+        Returns ``True`` when idle, ``False`` on timeout.  The loop only reads
+        controller state; it never holds a lock across an await.
+        """
+        self._check_backend(backend_id)
+        deadline = time.monotonic() + timeout_s
+        while True:
+            if not self._active[backend_id] and not self._queues[backend_id]:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(poll_interval_s)
+
+    async def wait_all_idle(
+        self, timeout_s: float, poll_interval_s: float = 0.02
+    ) -> bool:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            if self._active_total == 0 and self._queued_total == 0:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(poll_interval_s)
 
     # ------------------------------------------------------------------
     # acquisition
@@ -149,6 +230,8 @@ class AdmissionController:
         :meth:`acquire` (or :func:`acquire_with_disconnect`).
         """
         self._check_backend(backend_id)
+        if backend_id in self._draining:
+            raise AdmissionDraining(backend_id, "backend is draining")
         ticket = self._new_ticket(backend_id)
         if not self.config.enabled or self._has_capacity(backend_id):
             self._admit(ticket)
@@ -166,6 +249,8 @@ class AdmissionController:
         deadline, not a queue timeout.
         """
         self._check_backend(backend_id)
+        if backend_id in self._draining:
+            raise AdmissionDraining(backend_id, "backend is draining")
         ticket = self._new_ticket(backend_id)
         now = time.perf_counter()
         if deadline_at is not None and now >= deadline_at:

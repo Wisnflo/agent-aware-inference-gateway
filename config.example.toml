@@ -4,13 +4,20 @@
 [server]
 host = "127.0.0.1"
 port = 18080
-# "session_affinity" (X-Session-ID -> stable backend) or "round_robin".
+# "round_robin", "session_affinity", "prefix_affinity" or
+# "kv_cache_aware". Prefix strategies hash prompt text; they are not token/KV
+# location lookups.
 strategy = "session_affinity"
 health_interval_s = 5.0
 upstream_timeout_s = 300.0
 upstream_connect_timeout_s = 5.0
 max_connections_per_backend = 64
 max_keepalive_connections = 16
+# Request bodies larger than this are rejected with 413 before admission.
+max_request_body_bytes = 1048576
+# Admin drain and process shutdown wait this long for in-flight work.
+drain_timeout_s = 30.0
+shutdown_timeout_s = 10.0
 
 # Bounded admission. Every request is routed first, then admitted against the
 # target backend's queue. Set enabled = false only for benchmark baselines.
@@ -26,6 +33,27 @@ queue_timeout_ms = 2000
 a = 4
 b = 4
 
+# Prefix-affinity / KV-cache-aware routing. Character chunks approximate
+# token prefixes; cache-hit feedback is learned from llama.cpp timings.
+[prefix]
+chunk_chars = 128
+min_match_chars = 128
+max_nodes = 100000
+# Expire prefix/backend associations after this many seconds of no use.
+# 0 disables TTL; the node bound and LRU eviction still apply.
+ttl_seconds = 900
+# Overflow prefix-matched requests to a less-loaded healthy backend when all
+# matched backends reach this combined active+queued load. 0 disables overflow.
+load_overflow_threshold = 0
+# Optional tokenizer-aware prefix keys. Set this to a llama.cpp server running
+# the same model to route on token ids instead of character chunks. Leave unset
+# to keep the zero-dependency character mode.
+# tokenizer_url = "http://127.0.0.1:18090"
+# min_match_tokens = 16
+# token_block_size = 16
+# tokenizer_timeout_s = 1.0
+# tokenizer_cache_entries = 4096
+
 # Whole-request and execution budgets (monotonic, never reset by retries).
 [deadline]
 request_timeout_ms = 60000
@@ -36,9 +64,16 @@ execution_timeout_ms = 30000
 max_retries = 1
 
 # Health debounce: N consecutive failures remove, N successes restore.
+# Probes use a separate HTTP client and this total timeout.
 [health]
 failure_threshold = 2
 success_threshold = 2
+timeout_s = 2.0
+
+# Optional admin bearer token. Prefer the GATEWAY_ADMIN_TOKEN environment
+# variable over storing a secret here. Admin endpoints remain loopback-only.
+[admin]
+# token = "replace-me"
 
 [[backends]]
 id = "a"

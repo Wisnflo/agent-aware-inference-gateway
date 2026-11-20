@@ -217,6 +217,83 @@ class Metrics:
             ["backend"],
             registry=self.registry,
         )
+        self.prefix_decisions = Counter(
+            "gateway_prefix_routing_total",
+            "Prefix routing decisions by strategy and result.",
+            ["strategy", "result"],
+            registry=self.registry,
+        )
+        self.prefix_match_chars = Histogram(
+            "gateway_prefix_match_chars",
+            "Matched textual prefix length for prefix-aware decisions.",
+            ["backend"],
+            buckets=(32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536),
+            registry=self.registry,
+        )
+        self.prefix_match_tokens = Histogram(
+            "gateway_prefix_match_tokens",
+            "Matched model-token prefix length for tokenizer-aware decisions.",
+            ["backend"],
+            buckets=(1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
+            registry=self.registry,
+        )
+        self.cache_evidence = Counter(
+            "gateway_cache_evidence_total",
+            "Observed llama.cpp cache feedback by backend and result.",
+            ["backend", "result"],
+            registry=self.registry,
+        )
+        self.prefix_trie_nodes = Gauge(
+            "gateway_prefix_trie_nodes",
+            "Current prefix trie node count.",
+            registry=self.registry,
+        )
+        self.prefix_verified_entries = Gauge(
+            "gateway_prefix_verified_entries",
+            "Current fresh prefix/backend associations verified by cache_n > 0.",
+            registry=self.registry,
+        )
+        self.prefix_evictions = Counter(
+            "gateway_prefix_evictions_total",
+            "Prefix trie evictions by reason (ttl, lru, reset).",
+            ["reason"],
+            registry=self.registry,
+        )
+        self.prefix_registry_updates = Counter(
+            "gateway_prefix_registry_updates_total",
+            "Runtime router registry updates by action.",
+            ["action"],
+            registry=self.registry,
+        )
+        self.retry_prefix_preserved = Counter(
+            "gateway_retry_prefix_preserved_total",
+            "Retries whose replacement backend matched the request prefix.",
+            ["strategy"],
+            registry=self.registry,
+        )
+        self.request_body_rejected = Counter(
+            "gateway_request_body_rejected_total",
+            "Requests rejected before admission because the body exceeded the limit.",
+            ["route"],
+            registry=self.registry,
+        )
+        self.backend_draining = Gauge(
+            "gateway_backend_draining",
+            "1 when a backend is draining and receives no new work.",
+            ["backend"],
+            registry=self.registry,
+        )
+        self.admin_requests = Counter(
+            "gateway_admin_requests_total",
+            "Admin endpoint requests by action and result.",
+            ["action", "result"],
+            registry=self.registry,
+        )
+        self.admin_auth_failures = Counter(
+            "gateway_admin_auth_failures_total",
+            "Admin requests rejected by the bearer-token check.",
+            registry=self.registry,
+        )
         self.prompt_tokens = Counter(
             "gateway_prompt_tokens_total",
             "Prompt tokens seen in llama.cpp timings (cache hits plus fresh prefill).",
@@ -231,6 +308,15 @@ class Metrics:
             self.prompt_tokens_fresh.labels(backend_id).inc(fresh)
         if cached or fresh:
             self.prompt_tokens.labels(backend_id).inc(cached + fresh)
+
+    def sync_prefix_stats(self, stats) -> None:
+        """Mirror trie gauges into Prometheus metrics.
+
+        Eviction counters are incremented by the trie callback; only point-in-
+        time state is synced here so a scrape cannot double-count them.
+        """
+        self.prefix_trie_nodes.set(stats.nodes)
+        self.prefix_verified_entries.set(stats.verified_entries)
 
     def render(self) -> bytes:
         return generate_latest(self.registry)

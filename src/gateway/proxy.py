@@ -34,6 +34,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from .admission import (
     AdmissionController,
     AdmissionDeadlineExceeded,
+    AdmissionDraining,
     AdmissionRejected,
     AdmissionState,
     AdmissionTicket,
@@ -44,6 +45,8 @@ from .admission import (
 from .backends import Backend, BackendPool
 from .config import GatewayConfig
 from .metrics import Metrics
+from .middleware import REQUEST_ID_HEADER
+from .prefix import extract_prompt
 from .router import NoHealthyBackend, Router, RoutingDecision, session_fingerprint
 from .sse import SSEEventDecoder, first_content
 
@@ -89,6 +92,10 @@ class _AttemptTimeout(Exception):
 
 class _ClientGone(Exception):
     """The client disconnected while the gateway awaited upstream data."""
+
+
+class _BodyTooLarge(Exception):
+    """The request body exceeded ``max_request_body_bytes``."""
 
 
 @dataclass
@@ -249,31 +256,95 @@ class Proxy:
         router: Router,
         metrics: Metrics,
         admission: AdmissionController,
+        tokenizer=None,
     ) -> None:
         self.config = config
         self.pool = pool
         self.router = router
         self.metrics = metrics
         self.admission = admission
+        self.tokenizer = tokenizer
+        self.accepting = True
 
     async def handle(self, request: Request, route: str) -> Response:
+        if not self.accepting:
+            return _error(
+                503,
+                "shutting_down",
+                "gateway is shutting down and accepts no new requests",
+                headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
+            )
         started = time.perf_counter()
         request_deadline = started + self.config.deadline.request_timeout_ms / 1000.0
         session_id = request.headers.get("x-session-id")
+
+        declared = request.headers.get("content-length")
+        if declared is not None:
+            try:
+                declared_bytes = int(declared)
+            except ValueError:
+                declared_bytes = None
+            if (
+                declared_bytes is not None
+                and declared_bytes > self.config.max_request_body_bytes
+            ):
+                self.metrics.request_body_rejected.labels(route).inc()
+                return _error(
+                    413,
+                    "request_too_large",
+                    f"request body exceeds {self.config.max_request_body_bytes} bytes",
+                )
 
         try:
             async with asyncio.timeout(
                 max(0.000001, request_deadline - time.perf_counter())
             ):
-                body = await request.body()
+                body = await self._read_body_limited(request)
+        except _BodyTooLarge:
+            self.metrics.request_body_rejected.labels(route).inc()
+            return _error(
+                413,
+                "request_too_large",
+                f"request body exceeds {self.config.max_request_body_bytes} bytes",
+            )
         except TimeoutError:
             return self._no_backend_timeout(route, started, "request_deadline")
         except StarletteClientDisconnect:
             self._finish(route, NO_BACKEND, 499, started, None)
             return Response(status_code=499)
 
+        prompt = extract_prompt(route, body)
+        prefix_tokens = None
+        if (
+            self.tokenizer is not None
+            and prompt
+            and getattr(self.router, "strategy", None)
+            in ("prefix_affinity", "kv_cache_aware")
+        ):
+            prefix_tokens = await self.tokenizer.tokenize(
+                prompt,
+                remaining_s=max(0.0, request_deadline - time.perf_counter()),
+            )
+        healthy = self.pool.healthy_ids()
         try:
-            decision = self.router.decide(session_id, self.pool.healthy_ids())
+            decision = self.router.decide(
+                session_id,
+                healthy,
+                prompt=prompt,
+                loads=self._backend_loads(),
+                prefix_tokens=prefix_tokens,
+            )
+            if decision.backend.draining:
+                # A concurrent admin drain may have excluded the backend after
+                # this routing decision was formed; re-route once.
+                healthy = healthy - {decision.backend.id}
+                decision = self.router.decide(
+                    session_id,
+                    healthy,
+                    prompt=prompt,
+                    loads=self._backend_loads(),
+                    prefix_tokens=prefix_tokens,
+                )
         except NoHealthyBackend:
             self.metrics.requests_total.labels(route, "503", NO_BACKEND.id).inc()
             self.metrics.request_duration.labels(route, NO_BACKEND.id).observe(
@@ -288,6 +359,25 @@ class Proxy:
             )
 
         backend = decision.backend
+        strategy = getattr(self.router, "strategy", "unknown")
+        if decision.load_overflow:
+            self.metrics.prefix_decisions.labels(strategy, "overflow").inc()
+        elif decision.prefix_match_tokens:
+            self.metrics.prefix_decisions.labels(
+                strategy, "verified" if decision.cache_verified else "hit"
+            ).inc()
+            self.metrics.prefix_match_tokens.labels(backend.id).observe(
+                decision.prefix_match_tokens
+            )
+        elif decision.prefix_match_chars:
+            self.metrics.prefix_decisions.labels(
+                strategy, "verified" if decision.cache_verified else "hit"
+            ).inc()
+            self.metrics.prefix_match_chars.labels(backend.id).observe(
+                decision.prefix_match_chars
+            )
+        elif strategy in ("prefix_affinity", "kv_cache_aware"):
+            self.metrics.prefix_decisions.labels(strategy, "fallback").inc()
         if decision.failover:
             self.metrics.routing_failovers.labels(
                 decision.preferred_backend_id, backend.id
@@ -308,6 +398,15 @@ class Proxy:
 
         try:
             ticket = await self._acquire(request, route, backend, request_deadline)
+        except AdmissionDraining:
+            self.metrics.admission_rejected.labels(backend.id).inc()
+            self.sync_capacity_metrics()
+            return _error(
+                503,
+                "backend_draining",
+                f"backend {backend.id} is draining",
+                headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
+            )
         except AdmissionRejected:
             self.metrics.admission_rejected.labels(backend.id).inc()
             self.sync_capacity_metrics()
@@ -383,6 +482,55 @@ class Proxy:
             execution_deadline=execution_deadline,
             decision=decision,
             ticket=ticket,
+            prompt=prompt,
+            prefix_tokens=prefix_tokens,
+        )
+
+    async def get_models(self, request: Request) -> Response:
+        """Forward ``GET /v1/models`` to a healthy backend.
+
+        Model listing is read-only and not admitted against inference capacity;
+        it still uses the request deadline and the normal health filter.
+        """
+        if not self.accepting:
+            return _error(503, "shutting_down", "gateway is shutting down")
+        started = time.perf_counter()
+        deadline = started + self.config.deadline.request_timeout_ms / 1000.0
+        route = "v1_models"
+        try:
+            decision = self.router.decide(None, self.pool.healthy_ids())
+        except NoHealthyBackend:
+            self.metrics.requests_total.labels(route, "503", NO_BACKEND.id).inc()
+            return _error(503, "no_healthy_backend", "no healthy backend is available")
+        backend = decision.backend
+        if backend.client is None:
+            return _error(503, "no_healthy_backend", "backend client is not started")
+        try:
+            async with asyncio.timeout(max(0.000001, deadline - time.perf_counter())):
+                response = await backend.client.get(
+                    "/v1/models",
+                    headers={REQUEST_ID_HEADER: getattr(request.state, "request_id", "")},
+                )
+                raw = await response.aread()
+        except TimeoutError:
+            self._finish(route, backend, 504, started, None)
+            return _error(504, "request_deadline", "request deadline expired")
+        except httpx.HTTPError as exc:
+            self.pool.mark_failure(backend.id, type(exc).__name__)
+            self.metrics.upstream_errors.labels(backend.id, "stream").inc()
+            self._finish(route, backend, 502, started, None)
+            return _error(
+                502, "upstream_error", f"backend {backend.id}: {type(exc).__name__}"
+            )
+        self._finish(route, backend, response.status_code, started, None)
+        media_type = response.headers.get("content-type", "application/json").split(
+            ";", 1
+        )[0]
+        return Response(
+            content=raw,
+            status_code=response.status_code,
+            media_type=media_type,
+            headers={"x-gateway-backend": backend.id},
         )
 
     async def _execute(
@@ -398,6 +546,8 @@ class Proxy:
         execution_deadline: float,
         decision: RoutingDecision,
         ticket: AdmissionTicket,
+        prompt: str | None,
+        prefix_tokens=None,
     ) -> Response:
         upstream = None
         handed_off = False
@@ -489,7 +639,13 @@ class Proxy:
                     failed_backend = backend
                     healthy = self.pool.healthy_ids() - {failed_backend.id}
                     try:
-                        next_decision = self.router.decide(session_id, healthy)
+                        next_decision = self.router.decide(
+                            session_id,
+                            healthy,
+                            prompt=prompt,
+                            loads=self._backend_loads(),
+                            prefix_tokens=prefix_tokens,
+                        )
                     except NoHealthyBackend:
                         self.metrics.retry_results.labels(
                             failed_backend.id, "none", "no_backend"
@@ -502,9 +658,28 @@ class Proxy:
                         )
 
                     next_backend = next_decision.backend
+                    if (
+                        next_decision.prefix_match_chars
+                        or next_decision.prefix_match_tokens
+                    ):
+                        self.metrics.retry_prefix_preserved.labels(
+                            getattr(self.router, "strategy", "unknown")
+                        ).inc()
                     try:
                         next_ticket = await self._acquire(
                             request, route, next_backend, execution_deadline
+                        )
+                    except AdmissionDraining:
+                        self.metrics.retry_results.labels(
+                            failed_backend.id, next_backend.id, "draining"
+                        ).inc()
+                        self.metrics.admission_rejected.labels(next_backend.id).inc()
+                        self.sync_capacity_metrics()
+                        return _error(
+                            503,
+                            "backend_draining",
+                            f"backend {next_backend.id} is draining",
+                            headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
                         )
                     except AdmissionRejected:
                         self.metrics.retry_results.labels(
@@ -600,6 +775,14 @@ class Proxy:
                 ).inc()
                 retry_from = None
 
+            # Record the prefix only after upstream headers prove the attempt
+            # reached a backend.  Connect failures do not pollute the trie.
+            self.router.record_prompt(prompt, backend.id, prefix_tokens)
+            if upstream.status_code < 500:
+                # Dynamic health also learns from successful business traffic;
+                # a single 5xx remains request-specific and is not a health signal.
+                self.pool.mark_business_success(backend.id)
+
             content_type = upstream.headers.get("content-type", "")
             if upstream.status_code >= 500:
                 # A business 5xx is request-specific; it is not a health failure.
@@ -621,7 +804,15 @@ class Proxy:
                     )
 
                 response = _FinalizingStreamingResponse(
-                    self._stream(upstream, backend, route, started, state),
+                    self._stream(
+                        upstream,
+                        backend,
+                        route,
+                        started,
+                        state,
+                        prompt,
+                        prefix_tokens,
+                    ),
                     finalize,
                     deadline_at=execution_deadline,
                     timeout_kind=timeout_kind,
@@ -637,7 +828,9 @@ class Proxy:
                 raw = await self._read_with_disconnect(
                     request, upstream, execution_deadline - time.perf_counter()
                 )
-                self._observe_json_usage(backend, raw, content_type)
+                self._observe_json_usage(
+                    backend, raw, content_type, prompt, prefix_tokens
+                )
                 self.metrics.upstream_duration.labels(route, backend.id).observe(
                     time.perf_counter() - upstream_started
                 )
@@ -700,6 +893,18 @@ class Proxy:
                 finally:
                     if upstream is not None:
                         await self._aclose(upstream)
+
+    async def _read_body_limited(self, request: Request) -> bytes:
+        """Read a request body without buffering more than the configured cap."""
+        limit = self.config.max_request_body_bytes
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > limit:
+                raise _BodyTooLarge
+            chunks.append(chunk)
+        return b"".join(chunks)
 
     async def _acquire(
         self,
@@ -890,6 +1095,8 @@ class Proxy:
         route: str,
         started: float,
         state: _StreamState,
+        prompt: str | None = None,
+        prefix_tokens=None,
     ):
         decoder = SSEEventDecoder()
         try:
@@ -897,13 +1104,23 @@ class Proxy:
                 for event in decoder.feed(chunk):
                     state.events += 1
                     state.first_content_seen = self._observe_event(
-                        event, backend, started, state.first_content_seen
+                        event,
+                        backend,
+                        started,
+                        state.first_content_seen,
+                        prompt,
+                        prefix_tokens,
                     )
                 yield chunk
             for event in decoder.flush():
                 state.events += 1
                 state.first_content_seen = self._observe_event(
-                    event, backend, started, state.first_content_seen
+                    event,
+                    backend,
+                    started,
+                    state.first_content_seen,
+                    prompt,
+                    prefix_tokens,
                 )
         except asyncio.CancelledError:
             state.disconnected = True
@@ -991,6 +1208,8 @@ class Proxy:
         backend: Backend,
         started: float,
         first_content_seen: bool,
+        prompt: str | None = None,
+        prefix_tokens=None,
     ) -> bool:
         obj = event.json()
         if obj is None:
@@ -998,11 +1217,16 @@ class Proxy:
         if not first_content_seen and first_content(obj) is not None:
             self.metrics.ttft.labels(backend.id).observe(time.perf_counter() - started)
             first_content_seen = True
-        self._observe_timings(backend, obj)
+        self._observe_timings(backend, obj, prompt, prefix_tokens)
         return first_content_seen
 
     def _observe_json_usage(
-        self, backend: Backend, raw: bytes, content_type: str
+        self,
+        backend: Backend,
+        raw: bytes,
+        content_type: str,
+        prompt: str | None = None,
+        prefix_tokens=None,
     ) -> None:
         if "json" not in content_type.lower():
             return
@@ -1010,9 +1234,15 @@ class Proxy:
             obj = json.loads(raw)
         except (ValueError, RecursionError, UnicodeDecodeError):
             return
-        self._observe_timings(backend, obj)
+        self._observe_timings(backend, obj, prompt, prefix_tokens)
 
-    def _observe_timings(self, backend: Backend, obj: object) -> None:
+    def _observe_timings(
+        self,
+        backend: Backend,
+        obj: object,
+        prompt: str | None = None,
+        prefix_tokens=None,
+    ) -> None:
         if not isinstance(obj, dict):
             return
         timings = obj.get("timings")
@@ -1023,6 +1253,12 @@ class Proxy:
         if type(cached) is int and type(fresh) is int and cached >= 0 and fresh >= 0:
             try:
                 self.metrics.observe_usage(backend.id, cached, fresh)
+                self.metrics.cache_evidence.labels(
+                    backend.id, "hit" if cached > 0 else "miss"
+                ).inc()
+                self.router.record_cache_result(
+                    prompt, backend.id, cached, prefix_tokens
+                )
             except Exception:
                 # Upstream usage is optional telemetry, never response control.
                 logger.exception("cannot observe upstream usage backend=%s", backend.id)
@@ -1041,6 +1277,14 @@ class Proxy:
             if request_deadline <= execution_deadline
             else "execution_timeout"
         )
+
+    def _backend_loads(self) -> dict[str, int]:
+        stats = self.admission.stats()
+        return {
+            backend_id: stats.active_by_backend.get(backend_id, 0)
+            + stats.queued_by_backend.get(backend_id, 0)
+            for backend_id in self.admission.backend_ids
+        }
 
     def sync_capacity_metrics(self) -> None:
         stats = self.admission.stats()
@@ -1065,12 +1309,17 @@ class Proxy:
             headers[key] = value
         # Keep SSE bytes opaque: no compression and no automatic decoding.
         headers["accept-encoding"] = "identity"
+        request_id = getattr(request.state, "request_id", None)
+        if request_id:
+            headers[REQUEST_ID_HEADER] = request_id
         return headers
 
     def _upstream_path(self, request: Request, route: str) -> str:
         path = {
             "completion": "/completion",
             "chat_completions": "/v1/chat/completions",
+            "v1_completions": "/v1/completions",
+            "v1_embeddings": "/v1/embeddings",
         }[route]
         query = request.scope.get("query_string", b"").decode("ascii")
         if query:
